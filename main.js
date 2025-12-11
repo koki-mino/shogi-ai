@@ -183,7 +183,10 @@ function setMessage(text) {
   }
 }
 
-// ---- ボタン動作 ----
+// ---- イベント登録 ----
+// ★ここが前回抜けていたポイントです！★
+boardEl.addEventListener('click', handleBoardClick);
+
 resetButton.addEventListener('click', () => {
   state.board = createInitialBoard();
   state.sideToMove = 'S';
