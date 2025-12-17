@@ -2,242 +2,83 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8" />
-  <title>将棋AI 試作（ローカル版）</title>
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Shogi NN (TFJS) Demo</title>
+
+  <!-- TFJS -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+
   <style>
-    :root {
-      --board-size: min(90vw, 600px);
-      --cell-border: #555;
-      --cell-bg-light: #f9f1d6;
-      --cell-bg-dark: #f0e0b0;
-      --selected-bg: #facc15;
-      --sente-color: #111827;
-      --gote-color: #b91c1c;
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; margin: 16px; }
+    .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+    .card { border:1px solid #ddd; border-radius:12px; padding:12px; background:#fff; box-shadow:0 1px 6px rgba(0,0,0,.06); }
+    #board { border-collapse: collapse; }
+    #board td {
+      width: 44px; height: 44px; border: 1px solid #666;
+      text-align:center; vertical-align:middle; cursor:pointer;
+      font-size: 18px; user-select:none;
     }
-
-    body {
-      margin: 0;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
-                   "Helvetica Neue", Arial, "Noto Sans JP", sans-serif;
-      background: #e5e7eb;
-      color: #111827;
-      display: flex;
-      justify-content: center;
-      align-items: flex-start;
-      min-height: 100vh;
-      padding: 1rem;
-    }
-
-    .app {
-      background: #f9fafb;
-      border-radius: 1rem;
-      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.15);
-      padding: 1rem 1.25rem 1.5rem;
-      max-width: 800px;
-      width: 100%;
-    }
-
-    .app-header {
-      display: flex;
-      flex-direction: column;
-      gap: 0.25rem;
-      margin-bottom: 1rem;
-    }
-
-    .app-title {
-      font-size: 1.25rem;
-      font-weight: 700;
-    }
-
-    .app-subtitle {
-      font-size: 0.85rem;
-      color: #6b7280;
-    }
-
-    .status-bar {
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
-      gap: 0.5rem;
-      margin-bottom: 0.75rem;
-      font-size: 0.9rem;
-    }
-
-    .turn-label strong {
-      font-weight: 700;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.25rem;
-      padding: 0.1rem 0.5rem;
-      border-radius: 999px;
-      font-size: 0.75rem;
-      background: #eef2ff;
-      color: #3730a3;
-    }
-
-    .board-wrapper {
-      display: flex;
-      justify-content: center;
-      margin: 0.5rem 0 0.75rem;
-    }
-
-    .board {
-      width: var(--board-size);
-      height: var(--board-size);
-      max-width: 100%;
-      aspect-ratio: 1 / 1;
-      display: grid;
-      grid-template-columns: repeat(9, 1fr);
-      grid-template-rows: repeat(9, 1fr);
-      border: 2px solid var(--cell-border);
-      background: #b45309;
-      box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2);
-    }
-
-    .cell {
-      position: relative;
-      border: 1px solid var(--cell-border);
-      background: var(--cell-bg-light);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      cursor: pointer;
-      user-select: none;
-      -webkit-user-select: none;
-      touch-action: manipulation;
-      font-size: clamp(1.2rem, 3vw, 1.8rem);
-    }
-
-    .cell:nth-child(odd) {
-      background: var(--cell-bg-dark);
-    }
-
-    .cell.selected {
-      background: var(--selected-bg);
-    }
-
-    .cell:hover {
-      filter: brightness(1.05);
-    }
-
-    .piece {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 80%;
-      height: 80%;
-      border-radius: 0.5rem;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-align: center;
-    }
-
-    .piece.sente {
-      color: var(--sente-color);
-      background: rgba(249, 250, 251, 0.9);
-    }
-
-    .piece.gote {
-      color: var(--gote-color);
-      background: rgba(249, 250, 251, 0.9);
-      transform: rotate(180deg);
-    }
-
-    .controls {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.5rem;
-      margin-top: 0.5rem;
-    }
-
-    button {
-      border-radius: 999px;
-      border: none;
-      padding: 0.4rem 0.9rem;
-      font-size: 0.85rem;
-      display: inline-flex;
-      align-items: center;
-      gap: 0.35rem;
-      cursor: pointer;
-      background: #2563eb;
-      color: #f9fafb;
-      box-shadow: 0 2px 4px rgba(15, 23, 42, 0.2);
-      transition: transform 0.05s ease, box-shadow 0.05s ease, filter 0.1s ease;
-    }
-
-    button.secondary {
-      background: #6b7280;
-    }
-
-    button:hover {
-      filter: brightness(1.05);
-      box-shadow: 0 4px 8px rgba(15, 23, 42, 0.25);
-    }
-
-    button:active {
-      transform: translateY(1px);
-      box-shadow: 0 1px 3px rgba(15, 23, 42, 0.3);
-    }
-
-    .message {
-      margin-top: 0.5rem;
-      font-size: 0.8rem;
-      color: #4b5563;
-      min-height: 1.5em;
-    }
-
-    @media (max-width: 480px) {
-      .app {
-        padding: 0.75rem;
-      }
-      .app-title {
-        font-size: 1.05rem;
-      }
-    }
+    #board td.sel { outline: 3px solid #1e90ff; outline-offset:-3px; }
+    .piece-g { transform: rotate(180deg); display:inline-block; }
+    .hands { display:flex; gap:8px; flex-wrap:wrap; }
+    .handbtn { padding:6px 10px; border:1px solid #aaa; border-radius:10px; background:#f7f7f7; cursor:pointer; }
+    .handbtn.sel { outline: 3px solid #ff7a00; outline-offset:-3px; }
+    .muted { color:#666; font-size:12px; }
+    button { padding:8px 12px; border-radius:10px; border:1px solid #aaa; background:#f7f7f7; cursor:pointer; }
+    button.primary { background:#1e90ff; border-color:#1e90ff; color:#fff; }
+    input[type="number"]{ width:70px; padding:6px; border-radius:8px; border:1px solid #aaa; }
+    label { display:inline-flex; gap:8px; align-items:center; }
+    .status { white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
   </style>
 </head>
+
 <body>
-  <div class="app">
-    <header class="app-header">
-      <div class="app-title">将棋AI 試作（ローカル版）</div>
-      <div class="app-subtitle">
-        まずは「盤面表示＋手を動かす」土台です（AIの思考はこれから実装）。
-      </div>
-    </header>
-
-    <section class="status-bar">
-      <div class="turn-label">
-        手番：<strong id="turnLabel">先手</strong>
-      </div>
-      <div class="badge">
-        ローカル動作
-        <span>（index.html を開くだけ）</span>
-      </div>
-    </section>
-
-    <section class="board-wrapper">
-      <div id="board" class="board" aria-label="将棋盤"></div>
-    </section>
-
-    <section class="controls">
-      <button id="resetButton" type="button">
-        🔁 初期局面に戻す
-      </button>
-      <button id="aiMoveButton" type="button" class="secondary">
-        🤖 AIに指させる（ダミー）
-      </button>
-    </section>
-
-    <p id="message" class="message">
-      自分の駒をクリックしてから、移動先のマスをクリックしてください。
-      （まだルールチェックはしていません）
-    </p>
+  <h1>将棋AI（NN評価 + αβ探索）</h1>
+  <div class="muted">
+    NNモデル: <code>./shogi_eval_wars_tfjs/model.json</code>（入力名は読み取れた場合だけ表示）
   </div>
 
-  <script src="./main.js"></script>
+  <div class="row" style="margin-top:12px;">
+    <div class="card">
+      <table id="board"></table>
+      <div style="margin-top:10px;">
+        <div><b>先手の持ち駒（S）</b></div>
+        <div id="handsS" class="hands"></div>
+        <div style="margin-top:8px;"><b>後手の持ち駒（G）</b></div>
+        <div id="handsG" class="hands"></div>
+      </div>
+    </div>
+
+    <div class="card" style="min-width:320px;">
+      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        <button id="btnReset">初期化</button>
+        <button id="btnUndo">1手戻す</button>
+        <button id="btnAIMove" class="primary">AIに指させる</button>
+      </div>
+
+      <div style="margin-top:10px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <label>探索深さ(手数)
+          <input id="depth" type="number" min="1" max="7" value="3" />
+        </label>
+
+        <label>
+          <input id="useNN" type="checkbox" checked />
+          NN評価を使う
+        </label>
+      </div>
+
+      <div style="margin-top:10px;">
+        <div class="muted">操作：自分の駒をクリック→移動先をクリック。持ち駒はボタン→空マスクリックで打ち。</div>
+      </div>
+
+      <div style="margin-top:10px;">
+        <b>状態</b>
+        <div id="status" class="status"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- キャッシュ回避のためクエリ付け -->
+  <script src="./main.js?v=20251216_v3"></script>
 </body>
 </html>
