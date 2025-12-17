@@ -1,10 +1,12 @@
-/* worker.js v8
+/* worker.js v9
    - TT(Zobrist) + make/unmake
    - Killer/History move ordering
    - Quiescence search
    - NN evaluation cache (EvalTT)
    - Aspiration Window at root (iterative deepening)
-   - Depth途中で時間切れでも “その深さの途中ベスト” を返す
+   - PVS (null-window search)
+   - LMR (Late Move Reductions)
+   - bestStr を progress/result に同梱（main.js側で best=- 解消）
 */
 
 let tf = null;
@@ -26,6 +28,12 @@ const PTYPE_ID = {
 };
 const ID_PTYPE = Object.fromEntries(Object.entries(PTYPE_ID).map(([k,v])=>[v,k]));
 
+// --- v9: PVS/LMR tuning ---
+const PVS_WINDOW = 1.0;     // null-window幅（スコア単位）
+const LMR_MIN_DEPTH = 3;    // この深さ以上でLMRを使う
+const LMR_MOVE_NUM = 4;     // 4手目以降をLMR対象（序盤の数手は大事）
+const LMR_REDUCTION = 1;    // 1だけ浅く読む
+
 function sqIndex(x, y) { return y*9 + x; }
 function xyFromSq(sq){ return {x: sq % 9, y: (sq/9)|0}; }
 
@@ -34,6 +42,17 @@ let outputName = "Identity:0";
 let expectedD = 2283;
 
 let cancelRequestId = -1;
+
+/* ===================== UI best string ===================== */
+function moveToBestStr(mv){
+  const pad2 = (n)=>String(n).padStart(2,"0");
+  if (!mv) return "-";
+  if (mv.fromSq === -1){
+    const t = typeNameFromAbsId(mv.dropAbsId);
+    return `${t}@${pad2(mv.toSq)}`;
+  }
+  return `${pad2(mv.fromSq)}${pad2(mv.toSq)}${mv.promote ? "+" : ""}`;
+}
 
 /* ===================== Zobrist + TT ===================== */
 const MASK64 = (1n<<64n) - 1n;
@@ -701,7 +720,6 @@ function evalForSearch(state, useNN){
     return (state.side===0) ? m : -m;
   }
 
-  // NN評価キャッシュ（state.hash は side込みなので、そのままキーにできる）
   const cached = evalProbe(state.hash);
   if (cached != null) return cached;
 
@@ -784,12 +802,12 @@ function quiescence(state, alpha, beta, useNN, deadline, requestId){
   return alpha;
 }
 
-/* ===================== negamax ===================== */
+/* ===================== negamax (v9: PVS + LMR) ===================== */
 function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
   timeOrCancel(deadline, requestId);
 
-  // チェック中は1手延長（軽め）
-  if (isKingInCheck(state.board81, state.side, state.kingSqS, state.kingSqG)) depth += 1;
+  const inCheckHere = isKingInCheck(state.board81, state.side, state.kingSqS, state.kingSqG);
+  if (inCheckHere) depth += 1;
 
   const probe = ttProbe(state.hash, depth, alpha, beta);
   alpha = probe.alpha; beta = probe.beta;
@@ -800,8 +818,7 @@ function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
 
   const legals = genLegalMoves(state);
   if (legals.length === 0){
-    const inCheck = isKingInCheck(state.board81, state.side, state.kingSqS, state.kingSqG);
-    return inCheck ? -999999 : 0;
+    return inCheckHere ? -999999 : 0;
   }
 
   const alpha0 = alpha;
@@ -811,20 +828,57 @@ function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
   let best = -Infinity;
   let bestMove = ordered[0] || null;
 
+  let moveNum = 0;
+  let firstMove = true;
+
   for (const mv of ordered){
-    makeMove(state, mv, stack);
-    let score;
-    try {
-      score = -negamax(state, depth-1, -beta, -alpha, useNN, deadline, requestId, ply+1);
-    } finally {
-      unmakeMove(state, stack);
+    moveNum++;
+    timeOrCancel(deadline, requestId);
+
+    const quiet = isQuietMove(state, mv);
+    const depthLeft = depth - 1;
+
+    // LMR（遅い静かな手を浅く）
+    let reducedDepth = depthLeft;
+    let didReduce = false;
+    if (!inCheckHere &&
+        depth >= LMR_MIN_DEPTH &&
+        moveNum >= LMR_MOVE_NUM &&
+        quiet &&
+        mv.fromSq !== -1 &&          // 盤上の手だけ（打ちは重要なことが多いので安全側）
+        !mv.promote) {               // 成りは重要度高めなので減らさない
+      reducedDepth = Math.max(0, depthLeft - LMR_REDUCTION);
+      didReduce = (reducedDepth !== depthLeft);
     }
+
+    makeMove(state, mv, stack);
+
+    let score;
+    if (firstMove || !Number.isFinite(alpha) || !Number.isFinite(beta)) {
+      score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, ply+1);
+      firstMove = false;
+    } else {
+      // PVS: まず null-window
+      score = -negamax(state, reducedDepth, -(alpha + PVS_WINDOW), -alpha, useNN, deadline, requestId, ply+1);
+
+      // LMRで浅読みして上回ったら、同深さで null-window 再探索
+      if (didReduce && score > alpha) {
+        score = -negamax(state, depthLeft, -(alpha + PVS_WINDOW), -alpha, useNN, deadline, requestId, ply+1);
+      }
+
+      // 改善し、かつ beta 未満ならフルウィンドウで確定
+      if (score > alpha && score < beta) {
+        score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, ply+1);
+      }
+    }
+
+    unmakeMove(state, stack);
 
     if (score > best){ best = score; bestMove = mv; }
     if (score > alpha) alpha = score;
 
     if (alpha >= beta){
-      if (isQuietMove(state, mv)) recordKillerAndHistory(ply, mv, depth);
+      if (quiet) recordKillerAndHistory(ply, mv, depth);
       break;
     }
   }
@@ -837,7 +891,7 @@ function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
   return best;
 }
 
-/* ===================== root (alpha-beta with aspiration) ===================== */
+/* ===================== root (PVS) ===================== */
 function chooseBestRoot(state, depth, useNN, deadline, requestId, alphaInit, betaInit){
   timeOrCancel(deadline, requestId);
 
@@ -857,13 +911,26 @@ function chooseBestRoot(state, depth, useNN, deadline, requestId, alphaInit, bet
   const beta = betaInit;
 
   let timedOut = false;
+  let firstMove = true;
 
   for (const mv of ordered){
-    makeMove(state, mv, stack);
-    let score = null;
+    timeOrCancel(deadline, requestId);
 
+    makeMove(state, mv, stack);
+
+    let score = null;
     try {
-      score = -negamax(state, depth-1, -beta, -alpha, useNN, deadline, requestId, 1);
+      const depthLeft = depth - 1;
+
+      if (firstMove || !Number.isFinite(alpha) || !Number.isFinite(beta)) {
+        score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, 1);
+        firstMove = false;
+      } else {
+        score = -negamax(state, depthLeft, -(alpha + PVS_WINDOW), -alpha, useNN, deadline, requestId, 1);
+        if (score > alpha && score < beta) {
+          score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, 1);
+        }
+      }
     } catch(e){
       if (e && (e.message === "__TIME__" || e.message === "__CANCEL__" || e === "__TIME__" || e === "__CANCEL__")) {
         timedOut = true;
@@ -978,10 +1045,10 @@ self.onmessage = async (ev) => {
 
     let bestMove = null;
     let bestScore = null;
+    let bestStr = "-";
     let depthDone = 0;
     let partial = false;
 
-    // aspiration window 設定（スコアスケールが10000基準なので、まずは 200〜400 が扱いやすい）
     const BASE_WINDOW = 250;
 
     try {
@@ -991,7 +1058,6 @@ self.onmessage = async (ev) => {
         let r = null;
 
         if (d >= 3 && bestScore != null && Number.isFinite(bestScore)) {
-          // Aspiration Window
           let window = Math.max(BASE_WINDOW, Math.min(2000, Math.abs(bestScore) * 0.2));
           let alpha = bestScore - window;
           let beta  = bestScore + window;
@@ -1001,28 +1067,22 @@ self.onmessage = async (ev) => {
 
             r = chooseBestRoot(st0, d, useNN, deadline, requestId, alpha, beta);
 
-            // 時間切れならその時点の結果で終了
             if (r.partial) break;
-
             if (r.fail === "ok") break;
 
-            // fail-high/low -> 窓を広げて再検索
             window *= 2;
             alpha = bestScore - window;
             beta  = bestScore + window;
 
-            // ある程度超えたらフル窓に切替
             if (window > 8000) {
               alpha = -Infinity; beta = Infinity;
             }
           }
 
-          // それでも r が取れない(時間切れ等)なら、保険でフル窓1回
           if (!r || !r.ok) {
             r = chooseBestRoot(st0, d, useNN, deadline, requestId, -Infinity, Infinity);
           }
         } else {
-          // 通常フル窓
           r = chooseBestRoot(st0, d, useNN, deadline, requestId, -Infinity, Infinity);
         }
 
@@ -1030,6 +1090,7 @@ self.onmessage = async (ev) => {
 
         bestMove = r.move;
         bestScore = r.score;
+        bestStr = moveToBestStr(bestMove);
         depthDone = d;
         partial = !!r.partial;
 
@@ -1039,6 +1100,7 @@ self.onmessage = async (ev) => {
           depthDone,
           depthMax,
           bestScore,
+          bestStr,
           partial
         });
 
@@ -1054,6 +1116,7 @@ self.onmessage = async (ev) => {
       ok: !!bestMove,
       bestMove: bestMove ? toUiMove(bestMove) : null,
       bestScore,
+      bestStr,
       depthDone,
       partial,
       timeMs: Date.now() - start,
