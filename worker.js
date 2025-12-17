@@ -1,7 +1,8 @@
-/* worker.js v6
-   - make/unmake + TT(Zobrist) で高速化（深さが伸びやすい）
-   - 打ち歩詰め判定を「逃げ手の有無だけ」高速チェックに置換（重さ対策）
-   - TFJS GraphModel で NN 評価（葉）
+/* worker.js v7
+   - TT(Zobrist) + make/unmake
+   - Killer/History move ordering
+   - Quiescence search at depth<=0
+   - Depth途中で時間切れでも “その深さの途中ベスト” を返す
 */
 
 let tf = null;
@@ -35,30 +36,25 @@ let cancelRequestId = -1;
 /* ===================== Zobrist + TT ===================== */
 const MASK64 = (1n<<64n) - 1n;
 
-// TT size（大きいほど強くなるがメモリ増）: 2^19=524288
-const TT_POW = 19;
+// 2^20=1,048,576 entries（強さ/速度に効く。重いなら 19 に戻す）
+const TT_POW = 20;
 const TT_SIZE = 1 << TT_POW;
 const TT_MASK = (1n << BigInt(TT_POW)) - 1n;
 
-// typed-array TT（ChromeならOK）
-const TT_key = new BigUint64Array(TT_SIZE);     // hash
-const TT_val = new Float64Array(TT_SIZE);       // value
-const TT_dep = new Int16Array(TT_SIZE);         // depth
-const TT_flg = new Int8Array(TT_SIZE);          // 0 EXACT, 1 LOWER, 2 UPPER
-const TT_mov = new Int32Array(TT_SIZE);         // packed move (-1 = none)
+const TT_key = new BigUint64Array(TT_SIZE);
+const TT_val = new Float64Array(TT_SIZE);
+const TT_dep = new Int16Array(TT_SIZE);
+const TT_flg = new Int8Array(TT_SIZE);
+const TT_mov = new Int32Array(TT_SIZE);
 
 const TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
 
-// Zobrist tables
-// pieceZ[(color*15 + absId)*81 + sq]
 const pieceZ = new BigUint64Array(2 * 15 * 81);
-// handZ[(color*7 + pi)*19 + count]  count 0..18
 const handZ  = new BigUint64Array(2 * 7 * 19);
 let sideZ = 0n;
 
 let rngState = 0x123456789abcdef0n;
 function rand64(){
-  // LCG (64-bit)
   rngState = (rngState * 6364136223846793005n + 1442695040888963407n) & MASK64;
   return rngState;
 }
@@ -73,17 +69,10 @@ function pz(color, absId, sq){
   return pieceZ[((color*15 + absId) * 81) + sq];
 }
 function hz(color, handIndex, count){
-  // count 0..18
   return handZ[((color*7 + handIndex) * 19) + count];
 }
 
 function packMove(mv){
-  // bits:
-  // to (0..127) 7bits
-  // from (0..127) 7bits  (drop => 127)
-  // promote 1bit
-  // dropAbsId 4bits (0..14)
-  // hasMove implicit by packed!=-1
   const to = mv.toSq & 127;
   const from = (mv.fromSq === -1 ? 127 : (mv.fromSq & 127));
   const prom = mv.promote ? 1 : 0;
@@ -99,16 +88,13 @@ function unpackMove(packed){
   const fromSq = (from===127) ? -1 : from;
   return {fromSq, toSq, promote, dropAbsId: dropAbsId || 0};
 }
-function ttIndex(hash){
-  return Number(hash & TT_MASK); // safe (mask < 2^19)
-}
+function ttIndex(hash){ return Number(hash & TT_MASK); }
 function ttProbe(hash, depth, alpha, beta){
   const i = ttIndex(hash);
   const k = TT_key[i];
   if (k !== hash) return {hit:false, best:null, alpha, beta};
   const d = TT_dep[i];
   const best = unpackMove(TT_mov[i]);
-
   if (d >= depth) {
     const v = TT_val[i];
     const f = TT_flg[i];
@@ -125,7 +111,6 @@ function ttProbe(hash, depth, alpha, beta){
 }
 function ttStore(hash, depth, value, flag, bestMove){
   const i = ttIndex(hash);
-  // 置換：深いもの優先（同深さなら上書き）
   if (TT_key[i] !== hash || TT_dep[i] <= depth) {
     TT_key[i] = hash;
     TT_dep[i] = depth;
@@ -133,6 +118,32 @@ function ttStore(hash, depth, value, flag, bestMove){
     TT_flg[i] = flag;
     TT_mov[i] = bestMove ? packMove(bestMove) : -1;
   }
+}
+
+/* ===================== Killer / History ===================== */
+const MAX_PLY = 64;
+const killer1 = new Int32Array(MAX_PLY); killer1.fill(-1);
+const killer2 = new Int32Array(MAX_PLY); killer2.fill(-1);
+// fromIdx: 0..81 (drop=81) * toSq:0..80
+const hist = new Int32Array(82 * 81);
+
+function isQuietMove(state, mv){
+  if (mv.fromSq === -1) return true; // drop
+  const cap = state.board81[mv.toSq];
+  return cap === 0;
+}
+function histIndex(fromSq, toSq){
+  const fromIdx = (fromSq === -1) ? 81 : fromSq;
+  return fromIdx * 81 + toSq;
+}
+function recordKillerAndHistory(ply, state, mv, depth){
+  const pm = packMove(mv);
+  if (killer1[ply] !== pm) { killer2[ply] = killer1[ply]; killer1[ply] = pm; }
+  // historyは深さ^2で加点（効きが良い）
+  const idx = histIndex(mv.fromSq, mv.toSq);
+  hist[idx] += depth * depth;
+  // 上限で飽和
+  if (hist[idx] > 2000000000) hist[idx] = 1000000000;
 }
 
 /* ===================== TFJS ===================== */
@@ -172,16 +183,11 @@ function predictSenteValue(feats2283){
 
 /* ===================== Internal ===================== */
 function opp(side){ return side ^ 1; }
-
 function typeNameFromAbsId(absId){ return ID_PTYPE[absId] || "FU"; }
 function absIdFromTypeName(name){ return PTYPE_ID[name] || 1; }
-
-function handIndexOfTypeName(t){
-  return HAND_ORDER.indexOf(t); // -1 if not hand type
-}
+function handIndexOfTypeName(t){ return HAND_ORDER.indexOf(t); }
 function unpromoteTypeName(tName){ return UNPROM_MAP[tName] || tName; }
 function promoteTypeName(tName){ return PROM_MAP[tName] || tName; }
-
 function inPromoZone(side, y){ return side===0 ? (y<=2) : (y>=6); }
 function canPromote(tName){ return !!PROM_MAP[tName]; }
 function mustPromote(tName, side, toY){
@@ -189,9 +195,7 @@ function mustPromote(tName, side, toY){
   if (tName === 'KE') return side===0 ? (toY<=1) : (toY>=7);
   return false;
 }
-
 function isOwnPiece(pc, side){ return side===0 ? (pc>0) : (pc<0); }
-function isFoePiece(pc, side){ return side===0 ? (pc<0) : (pc>0); }
 
 function computeHash(board81, handsS, handsG, side){
   let h = 0n;
@@ -203,9 +207,8 @@ function computeHash(board81, handsS, handsG, side){
     h ^= pz(color, absId, sq);
   }
   for (let i=0;i<7;i++){
-    const cS = handsS[i]||0, cG = handsG[i]||0;
-    h ^= hz(0, i, cS);
-    h ^= hz(1, i, cG);
+    h ^= hz(0, i, handsS[i]||0);
+    h ^= hz(1, i, handsG[i]||0);
   }
   if (side===1) h ^= sideZ;
   return h & MASK64;
@@ -250,11 +253,8 @@ function hasUnpromotedPawnOnFile(board81, side, fileX){
     const sq = sqIndex(fileX,y);
     const pc = board81[sq];
     if (!pc) continue;
-    if (side===0){
-      if (pc === pawnId) return true;
-    } else {
-      if (pc === -pawnId) return true;
-    }
+    if (side===0){ if (pc === pawnId) return true; }
+    else { if (pc === -pawnId) return true; }
   }
   return false;
 }
@@ -264,9 +264,7 @@ function genPseudoMoves(state){
   const moves = [];
   const forward = (side===0) ? -1 : 1;
 
-  function pushMove(fromSq, toSq, promote){
-    moves.push({fromSq, toSq, promote: !!promote});
-  }
+  function pushMove(fromSq, toSq, promote){ moves.push({fromSq, toSq, promote: !!promote}); }
   function pushMoveWithPromo(fromSq, toSq, tName, fromY, toY){
     if (!canPromote(tName)) { pushMove(fromSq,toSq,false); return; }
     const promoPossible = inPromoZone(side, fromY) || inPromoZone(side, toY);
@@ -277,7 +275,6 @@ function genPseudoMoves(state){
     pushMove(fromSq,toSq,true);
   }
 
-  // board moves
   for (let sq=0;sq<81;sq++){
     const pc = board81[sq];
     if (!pc) continue;
@@ -337,7 +334,6 @@ function genPseudoMoves(state){
     }
   }
 
-  // drops
   const hands = (side===0) ? handsS : handsG;
   for (let i=0;i<7;i++){
     const n = hands[i];
@@ -358,6 +354,93 @@ function genPseudoMoves(state){
         if (hasUnpromotedPawnOnFile(board81, side, x)) continue;
       }
       moves.push({fromSq:-1, toSq, dropAbsId: absIdFromTypeName(tName), promote:false});
+    }
+  }
+
+  return moves;
+}
+
+/* ---- captures only (for quiescence) ---- */
+function genPseudoCaptures(state){
+  const {board81, side} = state;
+  const moves = [];
+  const forward = (side===0) ? -1 : 1;
+
+  function pushMove(fromSq, toSq, promote){ moves.push({fromSq, toSq, promote: !!promote}); }
+  function pushMoveWithPromo(fromSq, toSq, tName, fromY, toY){
+    if (!canPromote(tName)) { pushMove(fromSq,toSq,false); return; }
+    const promoPossible = inPromoZone(side, fromY) || inPromoZone(side, toY);
+    const forced = mustPromote(tName, side, toY);
+    if (!promoPossible) { pushMove(fromSq,toSq,false); return; }
+    if (forced) { pushMove(fromSq,toSq,true); return; }
+    pushMove(fromSq,toSq,false);
+    pushMove(fromSq,toSq,true);
+  }
+
+  const foeSign = (side===0) ? -1 : +1;
+
+  const isFoeAt = (sq)=>{
+    const pc = board81[sq];
+    return pc && ((pc>0?+1:-1) === foeSign);
+  };
+
+  for (let sq=0;sq<81;sq++){
+    const pc = board81[sq];
+    if (!pc) continue;
+    if (!isOwnPiece(pc, side)) continue;
+
+    const absId = Math.abs(pc);
+    const tName = typeNameFromAbsId(absId);
+    const {x,y} = xyFromSq(sq);
+
+    const addStepCap = (dx,dy)=>{
+      const nx=x+dx, ny=y+dy;
+      if (nx<0||nx>=9||ny<0||ny>=9) return;
+      const toSq = sqIndex(nx,ny);
+      if (!isFoeAt(toSq)) return;
+      pushMoveWithPromo(sq, toSq, tName, y, ny);
+    };
+    const addSlideCap = (dx,dy)=>{
+      for (let k=1;k<9;k++){
+        const nx=x+dx*k, ny=y+dy*k;
+        if (nx<0||nx>=9||ny<0||ny>=9) break;
+        const toSq=sqIndex(nx,ny);
+        const tp=board81[toSq];
+        if (!tp) continue;
+        if (isOwnPiece(tp, side)) break;
+        // foe piece => capture and stop
+        pushMoveWithPromo(sq,toSq,tName,y,ny);
+        break;
+      }
+    };
+
+    switch(tName){
+      case 'FU': addStepCap(0, forward); break;
+      case 'KY': addSlideCap(0, forward); break;
+      case 'KE': addStepCap(-1, 2*forward); addStepCap(1, 2*forward); break;
+      case 'GI':
+        addStepCap(-1, forward); addStepCap(0, forward); addStepCap(1, forward);
+        addStepCap(-1, -forward); addStepCap(1, -forward);
+        break;
+      case 'KI':
+      case 'TO': case 'NY': case 'NK': case 'NG':
+        addStepCap(-1, forward); addStepCap(0, forward); addStepCap(1, forward);
+        addStepCap(-1, 0); addStepCap(1, 0);
+        addStepCap(0, -forward);
+        break;
+      case 'KA': addSlideCap(1,1); addSlideCap(1,-1); addSlideCap(-1,1); addSlideCap(-1,-1); break;
+      case 'HI': addSlideCap(1,0); addSlideCap(-1,0); addSlideCap(0,1); addSlideCap(0,-1); break;
+      case 'OU':
+        for (const dx of [-1,0,1]) for (const dy of [-1,0,1]) if(dx||dy) addStepCap(dx,dy);
+        break;
+      case 'UM':
+        addSlideCap(1,1); addSlideCap(1,-1); addSlideCap(-1,1); addSlideCap(-1,-1);
+        addStepCap(1,0); addStepCap(-1,0); addStepCap(0,1); addStepCap(0,-1);
+        break;
+      case 'RY':
+        addSlideCap(1,0); addSlideCap(-1,0); addSlideCap(0,1); addSlideCap(0,-1);
+        addStepCap(1,1); addStepCap(1,-1); addStepCap(-1,1); addStepCap(-1,-1);
+        break;
     }
   }
 
@@ -407,7 +490,6 @@ function attacksSquare(board81, fromSq, pc, tx, ty){
   }
   return false;
 }
-
 function isKingInCheck(board81, side, kingSqS, kingSqG){
   const ksq = (side===0) ? kingSqS : kingSqG;
   if (ksq < 0) return false;
@@ -424,7 +506,7 @@ function isKingInCheck(board81, side, kingSqS, kingSqG){
   return false;
 }
 
-/* ===================== make/unmake + hash update ===================== */
+/* ===================== make/unmake (hash update) ===================== */
 function makeMove(state, mv, stack){
   const {board81} = state;
   const side = state.side;
@@ -443,15 +525,12 @@ function makeMove(state, mv, stack){
     handIncType: 0,
   };
 
-  // side-to-move toggle
   state.hash ^= sideZ;
 
   if (mv.fromSq === -1) {
-    // drop
     const absId = mv.dropAbsId;
     const pc = (side===0) ? absId : -absId;
 
-    // hand count change in hash
     const hands = (side===0) ? state.handsS : state.handsG;
     const tName = typeNameFromAbsId(absId);
     const hi = handIndexOfTypeName(tName);
@@ -461,7 +540,6 @@ function makeMove(state, mv, stack){
     state.hash ^= hz(side, hi, newC);
     hands[hi] = newC;
 
-    // place piece hash
     state.hash ^= pz(side, absId, mv.toSq);
     board81[mv.toSq] = pc;
     rec.movedPc = pc;
@@ -470,17 +548,11 @@ function makeMove(state, mv, stack){
     rec.movedPc = fromPc;
 
     const fromAbs = Math.abs(fromPc);
-    const fromColor = side;
+    state.hash ^= pz(side, fromAbs, mv.fromSq);
 
-    // remove from-square piece hash
-    state.hash ^= pz(fromColor, fromAbs, mv.fromSq);
-
-    // capture
     if (rec.capPc) {
-      const capColor = opp(side);
       const capAbs = Math.abs(rec.capPc);
-      // remove captured piece hash
-      state.hash ^= pz(capColor, capAbs, mv.toSq);
+      state.hash ^= pz(opp(side), capAbs, mv.toSq);
 
       const capName = typeNameFromAbsId(capAbs);
       const baseName = unpromoteTypeName(capName);
@@ -500,13 +572,11 @@ function makeMove(state, mv, stack){
 
     board81[mv.fromSq] = 0;
 
-    // moved piece (with promote)
     let tName = typeNameFromAbsId(fromAbs);
     if (mv.promote) tName = promoteTypeName(tName);
     const toAbs = absIdFromTypeName(tName);
     const toPc = (side===0) ? toAbs : -toAbs;
 
-    // add to-square piece hash
     state.hash ^= pz(side, toAbs, mv.toSq);
     board81[mv.toSq] = toPc;
 
@@ -526,7 +596,6 @@ function unmakeMove(state, stack){
   const rec = stack.pop();
   if (!rec) return;
 
-  // restore everything cheaply
   state.side = rec.prevSide;
   state.kingSqS = rec.prevKingS;
   state.kingSqG = rec.prevKingG;
@@ -537,7 +606,6 @@ function unmakeMove(state, stack){
 
   if (rec.fromSq === -1) {
     board81[rec.toSq] = 0;
-    // hands were restored by prevHash + state restore? (実体値も戻す必要あり)
     const absId = rec.dropAbsId;
     const tName = typeNameFromAbsId(absId);
     const hi = handIndexOfTypeName(tName);
@@ -556,71 +624,6 @@ function unmakeMove(state, stack){
   }
 }
 
-/* ===================== Fast uchi-fu-zume check ===================== */
-function hasAnyEscapeFromCheck(state, sideInCheck, checkSq){
-  // 逃げ手が1つでもあれば true
-  const stack = [];
-
-  const ksq = (sideInCheck===0) ? state.kingSqS : state.kingSqG;
-  if (ksq < 0) return true;
-
-  const {x:kx, y:ky} = xyFromSq(ksq);
-
-  // (1) king moves / captures
-  for (let dx=-1; dx<=1; dx++) for (let dy=-1; dy<=1; dy++){
-    if (!dx && !dy) continue;
-    const nx = kx+dx, ny = ky+dy;
-    if (nx<0||nx>=9||ny<0||ny>=9) continue;
-    const toSq = sqIndex(nx,ny);
-    const tp = state.board81[toSq];
-    if (tp && isOwnPiece(tp, sideInCheck)) continue;
-
-    const mv = {fromSq: ksq, toSq, promote:false};
-    makeMove(state, mv, stack);
-    const ok = !isKingInCheck(state.board81, sideInCheck, state.kingSqS, state.kingSqG);
-    unmakeMove(state, stack);
-    if (ok) return true;
-  }
-
-  // (2) capture the checking pawn by any piece (including non-king)
-  // 盤面を走査して「checkSqを攻撃できる駒」だけ試す
-  const {x:tx, y:ty} = xyFromSq(checkSq);
-  for (let sq=0;sq<81;sq++){
-    const pc = state.board81[sq];
-    if (!pc) continue;
-    if (!isOwnPiece(pc, sideInCheck)) continue;
-
-    // 擬似的に「この駒が checkSq を攻撃できるか」
-    if (!attacksSquare(state.board81, sq, pc, tx, ty)) continue;
-
-    const mv = {fromSq: sq, toSq: checkSq, promote:false};
-
-    // 成りが絡む駒は「成る/成らない」両方試す（最低限）
-    const absId = Math.abs(pc);
-    const tName = typeNameFromAbsId(absId);
-    const {y:fy} = xyFromSq(sq);
-
-    const tries = [];
-    if (canPromote(tName) && (inPromoZone(sideInCheck, fy) || inPromoZone(sideInCheck, ty)) && !mustPromote(tName, sideInCheck, ty)){
-      tries.push({...mv, promote:false});
-      tries.push({...mv, promote:true});
-    } else if (canPromote(tName) && mustPromote(tName, sideInCheck, ty)){
-      tries.push({...mv, promote:true});
-    } else {
-      tries.push(mv);
-    }
-
-    for (const m of tries){
-      makeMove(state, m, stack);
-      const ok = !isKingInCheck(state.board81, sideInCheck, state.kingSqS, state.kingSqG);
-      unmakeMove(state, stack);
-      if (ok) return true;
-    }
-  }
-
-  return false;
-}
-
 /* ===================== Legal moves ===================== */
 function genLegalMoves(state){
   const pseudo = genPseudoMoves(state);
@@ -630,28 +633,28 @@ function genLegalMoves(state){
   for (const mv of pseudo){
     makeMove(state, mv, stack);
 
-    const mover = opp(state.side); // make後にsideが反転しているので、元の手番側
+    const mover = opp(state.side);
     const ok = !isKingInCheck(state.board81, mover, state.kingSqS, state.kingSqG);
 
-    if (ok) {
-      // 打ち歩詰め（軽量版）
-      if (mv.fromSq === -1 && mv.dropAbsId === PTYPE_ID.FU) {
-        const foe = state.side; // 今の手番（相手）
-        if (isKingInCheck(state.board81, foe, state.kingSqS, state.kingSqG)) {
-          // 「逃げ手が無い」なら禁止
-          const hasEscape = hasAnyEscapeFromCheck(state, foe, mv.toSq);
-          if (!hasEscape) {
-            unmakeMove(state, stack);
-            continue;
-          }
-        }
-      }
-      legal.push(mv);
-    }
+    if (ok) legal.push(mv);
 
     unmakeMove(state, stack);
   }
 
+  return legal;
+}
+
+function genLegalCaptures(state){
+  const pseudo = genPseudoCaptures(state);
+  const legal = [];
+  const stack = [];
+  for (const mv of pseudo){
+    makeMove(state, mv, stack);
+    const mover = opp(state.side);
+    const ok = !isKingInCheck(state.board81, mover, state.kingSqS, state.kingSqG);
+    if (ok) legal.push(mv);
+    unmakeMove(state, stack);
+  }
   return legal;
 }
 
@@ -676,7 +679,6 @@ function materialEval(state){
   }
   return s;
 }
-
 function evalForSearch(state, useNN){
   if (!useNN || !model || !tf) {
     const m = materialEval(state);
@@ -692,74 +694,117 @@ function evalForSearch(state, useNN){
   return (state.side===0) ? senteScore : -senteScore;
 }
 
-/* ===================== search ===================== */
+/* ===================== time helpers ===================== */
 function timeOrCancel(deadline, requestId){
   if (requestId === cancelRequestId) throw new Error("__CANCEL__");
   if (Date.now() >= deadline) throw new Error("__TIME__");
 }
 
-function orderMovesSimple(state, moves, ttMove){
-  // TT move / capture / promote を軽量に優先（「毎手チェック判定」は重いのでやらない）
-  const b = state.board81;
-  const scored = moves.map(mv=>{
-    let sc = 0;
-    if (ttMove &&
-        mv.fromSq===ttMove.fromSq && mv.toSq===ttMove.toSq &&
-        (!!mv.promote)===(!!ttMove.promote) &&
-        ((mv.dropAbsId||0)===(ttMove.dropAbsId||0))) sc += 100000;
+/* ===================== ordering ===================== */
+function moveScore(state, mv, ttMovePacked, ply){
+  let sc = 0;
+  const pm = packMove(mv);
 
-    if (mv.fromSq !== -1) {
-      const cap = b[mv.toSq];
-      if (cap) {
-        const capName = typeNameFromAbsId(Math.abs(cap));
-        sc += (VALUE[capName]||0) + 200;
-      }
-      if (mv.promote) sc += 120;
-    } else {
-      sc += 15; // drop
-      if (mv.dropAbsId === PTYPE_ID.FU) sc += 10;
-    }
-    return {mv, sc};
-  });
+  if (ttMovePacked >= 0 && pm === ttMovePacked) sc += 1000000;
 
+  const cap = (mv.fromSq !== -1) ? state.board81[mv.toSq] : 0;
+  if (cap) {
+    const victim = VALUE[typeNameFromAbsId(Math.abs(cap))] || 0;
+    sc += 200000 + victim;
+    if (mv.promote) sc += 2000;
+  } else {
+    // quiet/drop
+    if (killer1[ply] === pm) sc += 150000;
+    else if (killer2[ply] === pm) sc += 140000;
+    sc += (hist[histIndex(mv.fromSq, mv.toSq)] || 0);
+    if (mv.fromSq === -1) sc += 500; // drop small bonus
+  }
+  return sc;
+}
+
+function orderMoves(state, moves, ttMove, ply){
+  const ttPacked = ttMove ? packMove(ttMove) : -1;
+  const scored = moves.map(mv => ({mv, sc: moveScore(state, mv, ttPacked, ply)}));
   scored.sort((a,b)=>b.sc-a.sc);
   return scored.map(x=>x.mv);
 }
 
-function negamax(state, depth, alpha, beta, useNN, deadline, requestId){
+/* ===================== quiescence ===================== */
+function quiescence(state, alpha, beta, useNN, deadline, requestId){
   timeOrCancel(deadline, requestId);
 
-  // TT probe
+  const stand = evalForSearch(state, useNN);
+  if (stand >= beta) return stand;
+  if (stand > alpha) alpha = stand;
+
+  const caps = genLegalCaptures(state);
+  if (caps.length === 0) return stand;
+
+  // capture ordering: victim value desc
+  caps.sort((a,b)=>{
+    const va = VALUE[typeNameFromAbsId(Math.abs(state.board81[a.toSq]||0))]||0;
+    const vb = VALUE[typeNameFromAbsId(Math.abs(state.board81[b.toSq]||0))]||0;
+    return vb - va;
+  });
+
+  const stack = [];
+  for (const mv of caps){
+    makeMove(state, mv, stack);
+    const score = -quiescence(state, -beta, -alpha, useNN, deadline, requestId);
+    unmakeMove(state, stack);
+
+    if (score >= beta) return score;
+    if (score > alpha) alpha = score;
+  }
+  return alpha;
+}
+
+/* ===================== negamax ===================== */
+function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
+  timeOrCancel(deadline, requestId);
+
+  // チェック中は1手延長（軽めの強化）
+  if (isKingInCheck(state.board81, state.side, state.kingSqS, state.kingSqG)) depth += 1;
+
+  // TT
   const probe = ttProbe(state.hash, depth, alpha, beta);
   alpha = probe.alpha; beta = probe.beta;
   const ttMove = probe.best;
   if (probe.hit && probe.cut) return probe.value;
 
+  // leaf => quiescence
+  if (depth <= 0) return quiescence(state, alpha, beta, useNN, deadline, requestId);
+
   const legals = genLegalMoves(state);
-  if (legals.length===0){
+  if (legals.length === 0){
     const inCheck = isKingInCheck(state.board81, state.side, state.kingSqS, state.kingSqG);
     return inCheck ? -999999 : 0;
   }
-  if (depth<=0) return evalForSearch(state, useNN);
 
   const alpha0 = alpha;
-  const ordered = orderMovesSimple(state, legals, ttMove);
-  const stack=[];
+  const ordered = orderMoves(state, legals, ttMove, ply);
+  const stack = [];
 
   let best = -Infinity;
   let bestMove = ordered[0] || null;
 
   for (const mv of ordered){
     makeMove(state, mv, stack);
-    const score = -negamax(state, depth-1, -beta, -alpha, useNN, deadline, requestId);
-    unmakeMove(state, stack);
-
-    if (score > best){
-      best = score;
-      bestMove = mv;
+    let score;
+    try {
+      score = -negamax(state, depth-1, -beta, -alpha, useNN, deadline, requestId, ply+1);
+    } finally {
+      unmakeMove(state, stack);
     }
+
+    if (score > best){ best = score; bestMove = mv; }
     if (score > alpha) alpha = score;
-    if (alpha >= beta) break;
+
+    if (alpha >= beta){
+      // beta-cut: quietなら killer/history 更新
+      if (isQuietMove(state, mv)) recordKillerAndHistory(ply, state, mv, depth);
+      break;
+    }
   }
 
   let flag = TT_EXACT;
@@ -777,29 +822,39 @@ function chooseBestRoot(state, depth, useNN, deadline, requestId){
   const ttMove = probe.best;
 
   const legals = genLegalMoves(state);
-  if (legals.length===0) return null;
+  if (legals.length === 0) return null;
 
-  const ordered = orderMovesSimple(state, legals, ttMove);
-  const stack=[];
+  const ordered = orderMoves(state, legals, ttMove, 0);
+  const stack = [];
 
   let bestMove = ordered[0];
   let bestScore = -Infinity;
+
   let alpha = -Infinity, beta = Infinity;
+  let timedOut = false;
 
   for (const mv of ordered){
     makeMove(state, mv, stack);
-    const score = -negamax(state, depth-1, -beta, -alpha, useNN, deadline, requestId);
-    unmakeMove(state, stack);
-
-    if (score > bestScore){
-      bestScore = score;
-      bestMove = mv;
+    let score = null;
+    try {
+      score = -negamax(state, depth-1, -beta, -alpha, useNN, deadline, requestId, 1);
+    } catch(e){
+      if (e && (e.message === "__TIME__" || e.message === "__CANCEL__" || e === "__TIME__" || e === "__CANCEL__")) {
+        timedOut = true;
+      } else {
+        throw e;
+      }
+    } finally {
+      unmakeMove(state, stack);
     }
+    if (timedOut) break;
+
+    if (score > bestScore){ bestScore = score; bestMove = mv; }
     if (score > alpha) alpha = score;
   }
 
-  ttStore(state.hash, depth, bestScore, TT_EXACT, bestMove);
-  return {move: bestMove, score: bestScore};
+  if (bestMove) ttStore(state.hash, depth, bestScore, TT_EXACT, bestMove);
+  return {move: bestMove, score: bestScore, partial: timedOut};
 }
 
 function toUiMove(mv){
@@ -889,6 +944,7 @@ self.onmessage = async (ev) => {
     let bestMove = null;
     let bestScore = null;
     let depthDone = 0;
+    let partial = false;
 
     try {
       for (let d=1; d<=depthMax; d++){
@@ -900,6 +956,7 @@ self.onmessage = async (ev) => {
         bestMove = r.move;
         bestScore = r.score;
         depthDone = d;
+        partial = !!r.partial;
 
         self.postMessage({
           type:"progress",
@@ -907,10 +964,14 @@ self.onmessage = async (ev) => {
           depthDone,
           depthMax,
           bestScore,
+          partial
         });
+
+        // 深さdが partial（途中打ち切り）なら、これ以上深く行っても無理なので終了
+        if (partial) break;
       }
     } catch(e) {
-      // __TIME__ / __CANCEL__ は想定内
+      // time/cancel は想定内
     }
 
     self.postMessage({
@@ -920,6 +981,7 @@ self.onmessage = async (ev) => {
       bestMove: bestMove ? toUiMove(bestMove) : null,
       bestScore,
       depthDone,
+      partial,
       timeMs: Date.now() - start,
       modelStatus
     });
