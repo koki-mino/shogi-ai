@@ -1,7 +1,9 @@
-/* worker.js v7
+/* worker.js v8
    - TT(Zobrist) + make/unmake
    - Killer/History move ordering
-   - Quiescence search at depth<=0
+   - Quiescence search
+   - NN evaluation cache (EvalTT)
+   - Aspiration Window at root (iterative deepening)
    - Depth途中で時間切れでも “その深さの途中ベスト” を返す
 */
 
@@ -36,7 +38,7 @@ let cancelRequestId = -1;
 /* ===================== Zobrist + TT ===================== */
 const MASK64 = (1n<<64n) - 1n;
 
-// 2^20=1,048,576 entries（強さ/速度に効く。重いなら 19 に戻す）
+// TT: 2^20 = 1,048,576 entries
 const TT_POW = 20;
 const TT_SIZE = 1 << TT_POW;
 const TT_MASK = (1n << BigInt(TT_POW)) - 1n;
@@ -48,6 +50,25 @@ const TT_flg = new Int8Array(TT_SIZE);
 const TT_mov = new Int32Array(TT_SIZE);
 
 const TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
+
+// NN評価キャッシュ（EvalTT）: 2^19 = 524,288 entries
+const ETT_POW = 19;
+const ETT_SIZE = 1 << ETT_POW;
+const ETT_MASK = (1n << BigInt(ETT_POW)) - 1n;
+const ETT_key = new BigUint64Array(ETT_SIZE);   // key = (hash ^ 1n)
+const ETT_val = new Float32Array(ETT_SIZE);     // value = eval score (side-to-move perspective)
+function evalProbe(hash){
+  const i = Number(hash & ETT_MASK);
+  const k = ETT_key[i];
+  const hk = (hash ^ 1n);
+  if (k === hk) return ETT_val[i];
+  return null;
+}
+function evalStore(hash, v){
+  const i = Number(hash & ETT_MASK);
+  ETT_key[i] = (hash ^ 1n);
+  ETT_val[i] = v;
+}
 
 const pieceZ = new BigUint64Array(2 * 15 * 81);
 const handZ  = new BigUint64Array(2 * 7 * 19);
@@ -88,7 +109,9 @@ function unpackMove(packed){
   const fromSq = (from===127) ? -1 : from;
   return {fromSq, toSq, promote, dropAbsId: dropAbsId || 0};
 }
+
 function ttIndex(hash){ return Number(hash & TT_MASK); }
+
 function ttProbe(hash, depth, alpha, beta){
   const i = ttIndex(hash);
   const k = TT_key[i];
@@ -109,6 +132,7 @@ function ttProbe(hash, depth, alpha, beta){
   }
   return {hit:true, cut:false, best, alpha, beta};
 }
+
 function ttStore(hash, depth, value, flag, bestMove){
   const i = ttIndex(hash);
   if (TT_key[i] !== hash || TT_dep[i] <= depth) {
@@ -124,11 +148,10 @@ function ttStore(hash, depth, value, flag, bestMove){
 const MAX_PLY = 64;
 const killer1 = new Int32Array(MAX_PLY); killer1.fill(-1);
 const killer2 = new Int32Array(MAX_PLY); killer2.fill(-1);
-// fromIdx: 0..81 (drop=81) * toSq:0..80
 const hist = new Int32Array(82 * 81);
 
 function isQuietMove(state, mv){
-  if (mv.fromSq === -1) return true; // drop
+  if (mv.fromSq === -1) return true;
   const cap = state.board81[mv.toSq];
   return cap === 0;
 }
@@ -136,13 +159,11 @@ function histIndex(fromSq, toSq){
   const fromIdx = (fromSq === -1) ? 81 : fromSq;
   return fromIdx * 81 + toSq;
 }
-function recordKillerAndHistory(ply, state, mv, depth){
+function recordKillerAndHistory(ply, mv, depth){
   const pm = packMove(mv);
   if (killer1[ply] !== pm) { killer2[ply] = killer1[ply]; killer1[ply] = pm; }
-  // historyは深さ^2で加点（効きが良い）
   const idx = histIndex(mv.fromSq, mv.toSq);
   hist[idx] += depth * depth;
-  // 上限で飽和
   if (hist[idx] > 2000000000) hist[idx] = 1000000000;
 }
 
@@ -360,7 +381,6 @@ function genPseudoMoves(state){
   return moves;
 }
 
-/* ---- captures only (for quiescence) ---- */
 function genPseudoCaptures(state){
   const {board81, side} = state;
   const moves = [];
@@ -378,7 +398,6 @@ function genPseudoCaptures(state){
   }
 
   const foeSign = (side===0) ? -1 : +1;
-
   const isFoeAt = (sq)=>{
     const pc = board81[sq];
     return pc && ((pc>0?+1:-1) === foeSign);
@@ -408,7 +427,6 @@ function genPseudoCaptures(state){
         const tp=board81[toSq];
         if (!tp) continue;
         if (isOwnPiece(tp, side)) break;
-        // foe piece => capture and stop
         pushMoveWithPromo(sq,toSq,tName,y,ny);
         break;
       }
@@ -490,6 +508,7 @@ function attacksSquare(board81, fromSq, pc, tx, ty){
   }
   return false;
 }
+
 function isKingInCheck(board81, side, kingSqS, kingSqG){
   const ksq = (side===0) ? kingSqS : kingSqG;
   if (ksq < 0) return false;
@@ -632,15 +651,11 @@ function genLegalMoves(state){
 
   for (const mv of pseudo){
     makeMove(state, mv, stack);
-
     const mover = opp(state.side);
     const ok = !isKingInCheck(state.board81, mover, state.kingSqS, state.kingSqG);
-
     if (ok) legal.push(mv);
-
     unmakeMove(state, stack);
   }
-
   return legal;
 }
 
@@ -679,19 +694,31 @@ function materialEval(state){
   }
   return s;
 }
+
 function evalForSearch(state, useNN){
   if (!useNN || !model || !tf) {
     const m = materialEval(state);
     return (state.side===0) ? m : -m;
   }
+
+  // NN評価キャッシュ（state.hash は side込みなので、そのままキーにできる）
+  const cached = evalProbe(state.hash);
+  if (cached != null) return cached;
+
   const feats = encodeForNN(state.board81, state.handsS, state.handsG, state.side);
   const v = predictSenteValue(feats);
+
+  let score;
   if (v == null || Number.isNaN(v)) {
     const m = materialEval(state);
-    return (state.side===0) ? m : -m;
+    score = (state.side===0) ? m : -m;
+  } else {
+    const senteScore = v * 10000.0;
+    score = (state.side===0) ? senteScore : -senteScore;
   }
-  const senteScore = v * 10000.0;
-  return (state.side===0) ? senteScore : -senteScore;
+
+  evalStore(state.hash, score);
+  return score;
 }
 
 /* ===================== time helpers ===================== */
@@ -713,11 +740,10 @@ function moveScore(state, mv, ttMovePacked, ply){
     sc += 200000 + victim;
     if (mv.promote) sc += 2000;
   } else {
-    // quiet/drop
     if (killer1[ply] === pm) sc += 150000;
     else if (killer2[ply] === pm) sc += 140000;
     sc += (hist[histIndex(mv.fromSq, mv.toSq)] || 0);
-    if (mv.fromSq === -1) sc += 500; // drop small bonus
+    if (mv.fromSq === -1) sc += 500;
   }
   return sc;
 }
@@ -740,7 +766,6 @@ function quiescence(state, alpha, beta, useNN, deadline, requestId){
   const caps = genLegalCaptures(state);
   if (caps.length === 0) return stand;
 
-  // capture ordering: victim value desc
   caps.sort((a,b)=>{
     const va = VALUE[typeNameFromAbsId(Math.abs(state.board81[a.toSq]||0))]||0;
     const vb = VALUE[typeNameFromAbsId(Math.abs(state.board81[b.toSq]||0))]||0;
@@ -763,16 +788,14 @@ function quiescence(state, alpha, beta, useNN, deadline, requestId){
 function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
   timeOrCancel(deadline, requestId);
 
-  // チェック中は1手延長（軽めの強化）
+  // チェック中は1手延長（軽め）
   if (isKingInCheck(state.board81, state.side, state.kingSqS, state.kingSqG)) depth += 1;
 
-  // TT
   const probe = ttProbe(state.hash, depth, alpha, beta);
   alpha = probe.alpha; beta = probe.beta;
   const ttMove = probe.best;
   if (probe.hit && probe.cut) return probe.value;
 
-  // leaf => quiescence
   if (depth <= 0) return quiescence(state, alpha, beta, useNN, deadline, requestId);
 
   const legals = genLegalMoves(state);
@@ -801,8 +824,7 @@ function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
     if (score > alpha) alpha = score;
 
     if (alpha >= beta){
-      // beta-cut: quietなら killer/history 更新
-      if (isQuietMove(state, mv)) recordKillerAndHistory(ply, state, mv, depth);
+      if (isQuietMove(state, mv)) recordKillerAndHistory(ply, mv, depth);
       break;
     }
   }
@@ -815,27 +837,31 @@ function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
   return best;
 }
 
-function chooseBestRoot(state, depth, useNN, deadline, requestId){
+/* ===================== root (alpha-beta with aspiration) ===================== */
+function chooseBestRoot(state, depth, useNN, deadline, requestId, alphaInit, betaInit){
   timeOrCancel(deadline, requestId);
 
-  const probe = ttProbe(state.hash, depth, -Infinity, Infinity);
+  const probe = ttProbe(state.hash, depth, alphaInit, betaInit);
   const ttMove = probe.best;
 
   const legals = genLegalMoves(state);
-  if (legals.length === 0) return null;
+  if (legals.length === 0) return {ok:false};
 
   const ordered = orderMoves(state, legals, ttMove, 0);
   const stack = [];
 
-  let bestMove = ordered[0];
+  let bestMove = ordered[0] || null;
   let bestScore = -Infinity;
 
-  let alpha = -Infinity, beta = Infinity;
+  let alpha = alphaInit;
+  const beta = betaInit;
+
   let timedOut = false;
 
   for (const mv of ordered){
     makeMove(state, mv, stack);
     let score = null;
+
     try {
       score = -negamax(state, depth-1, -beta, -alpha, useNN, deadline, requestId, 1);
     } catch(e){
@@ -847,14 +873,23 @@ function chooseBestRoot(state, depth, useNN, deadline, requestId){
     } finally {
       unmakeMove(state, stack);
     }
+
     if (timedOut) break;
 
     if (score > bestScore){ bestScore = score; bestMove = mv; }
     if (score > alpha) alpha = score;
+    if (alpha >= beta) break;
   }
 
-  if (bestMove) ttStore(state.hash, depth, bestScore, TT_EXACT, bestMove);
-  return {move: bestMove, score: bestScore, partial: timedOut};
+  if (!bestMove || bestScore === -Infinity) return {ok:false};
+
+  const fail =
+    (bestScore <= alphaInit) ? "low" :
+    (bestScore >= betaInit) ? "high" : "ok";
+
+  if (!timedOut) ttStore(state.hash, depth, bestScore, TT_EXACT, bestMove);
+
+  return { ok:true, move: bestMove, score: bestScore, partial: timedOut, fail };
 }
 
 function toUiMove(mv){
@@ -907,7 +942,7 @@ async function initTF(modelUrl, backend){
     });
 
     modelStatus = "読込完了";
-    return {ok:true, info:`backend=${tf.getBackend()} inputKey=${inputKey} D=${expectedD} TT=${TT_SIZE}`};
+    return {ok:true, info:`backend=${tf.getBackend()} inputKey=${inputKey} D=${expectedD} TT=${TT_SIZE} EvalTT=${ETT_SIZE}`};
   } catch(e) {
     model=null;
     modelStatus="読込失敗";
@@ -946,12 +981,52 @@ self.onmessage = async (ev) => {
     let depthDone = 0;
     let partial = false;
 
+    // aspiration window 設定（スコアスケールが10000基準なので、まずは 200〜400 が扱いやすい）
+    const BASE_WINDOW = 250;
+
     try {
       for (let d=1; d<=depthMax; d++){
         timeOrCancel(deadline, requestId);
 
-        const r = chooseBestRoot(st0, d, useNN, deadline, requestId);
-        if (!r || !r.move) break;
+        let r = null;
+
+        if (d >= 3 && bestScore != null && Number.isFinite(bestScore)) {
+          // Aspiration Window
+          let window = Math.max(BASE_WINDOW, Math.min(2000, Math.abs(bestScore) * 0.2));
+          let alpha = bestScore - window;
+          let beta  = bestScore + window;
+
+          for (let attempt=0; attempt<3; attempt++){
+            timeOrCancel(deadline, requestId);
+
+            r = chooseBestRoot(st0, d, useNN, deadline, requestId, alpha, beta);
+
+            // 時間切れならその時点の結果で終了
+            if (r.partial) break;
+
+            if (r.fail === "ok") break;
+
+            // fail-high/low -> 窓を広げて再検索
+            window *= 2;
+            alpha = bestScore - window;
+            beta  = bestScore + window;
+
+            // ある程度超えたらフル窓に切替
+            if (window > 8000) {
+              alpha = -Infinity; beta = Infinity;
+            }
+          }
+
+          // それでも r が取れない(時間切れ等)なら、保険でフル窓1回
+          if (!r || !r.ok) {
+            r = chooseBestRoot(st0, d, useNN, deadline, requestId, -Infinity, Infinity);
+          }
+        } else {
+          // 通常フル窓
+          r = chooseBestRoot(st0, d, useNN, deadline, requestId, -Infinity, Infinity);
+        }
+
+        if (!r || !r.ok || !r.move) break;
 
         bestMove = r.move;
         bestScore = r.score;
@@ -967,7 +1042,6 @@ self.onmessage = async (ev) => {
           partial
         });
 
-        // 深さdが partial（途中打ち切り）なら、これ以上深く行っても無理なので終了
         if (partial) break;
       }
     } catch(e) {
