@@ -201,47 +201,51 @@ function initWorker() {
   workerLastInfo = "";
   setStatus();
 
-  worker.onmessage = (ev) => {
-    const msg = ev.data || {};
-    if (msg.type === "init_done") {
-      workerReady = !!msg.ok;
-      workerModelStatus = msg.ok ? "読込完了" : ("読込失敗: " + (msg.error || ""));
-      workerLastInfo = msg.info ? `info: ${msg.info}` : "";
-      setStatus();
-      return;
-    }
+  worker.onmessage = (e) => {
+  const msg = e.data || {};
 
-    if (msg.type === "progress") {
-      // 任意：進捗を表示
-      if (thinking) {
-        workerLastInfo = `depth=${msg.depthDone}/${msg.depthMax} best=${msg.bestUci || "-"} score=${(msg.bestScore ?? "").toString()}`;
-        setStatus("AI思考中...");
-      }
-      return;
-    }
+  if (msg.type === "init_done") {
+    workerReady = true;
+    workerModelStatus = msg.ok ? "読込完了" : ("読込失敗: " + (msg.error || ""));
+    workerInfo = msg.info || "";
+    thinking = false;
+    setStatus();
+    return;
+  }
 
-    if (msg.type === "result") {
-      if (msg.requestId !== lastRequestId) return; // 古い結果は無視
-      thinking = false;
+  if (msg.type === "progress") {
+    // ★bestStr が来たら表示に使う（best=- を解消）
+    if (typeof msg.bestStr === "string") lastBestStr = msg.bestStr;
 
-      if (msg.ok && msg.bestMove) {
-        pushHistory();
-        ({board, hands, sideToMove} = applyMove(board, hands, sideToMove, msg.bestMove));
-        selected = null;
-        selectedDrop = null;
-        afterMove();
-        setStatus(`AI: depth_done=${msg.depthDone} time=${msg.timeMs}ms score=${msg.bestScore}`);
-      } else {
-        setStatus("AI: 結果なし / 中断");
-      }
-      return;
-    }
+    if (typeof msg.bestScore === "number") lastBestScore = msg.bestScore;
+    if (typeof msg.depthDone === "number") lastDepthDone = msg.depthDone;
+    if (typeof msg.depthMax === "number") lastDepthMax = msg.depthMax;
+    if (typeof msg.partial === "boolean") lastPartial = msg.partial;
 
-    if (msg.type === "log") {
-      // console.log("[worker]", msg.message);
-      return;
+    setStatus();
+    return;
+  }
+
+  if (msg.type === "result") {
+    thinking = false;
+
+    if (typeof msg.bestStr === "string") lastBestStr = msg.bestStr; // ★ここも
+    if (typeof msg.bestScore === "number") lastBestScore = msg.bestScore;
+    if (typeof msg.depthDone === "number") lastDepthDone = msg.depthDone;
+    lastTimeMs = msg.timeMs || 0;
+
+    if (msg.ok && msg.bestMove) {
+      // 盤に適用（既存の applyMove を使う想定）
+      pushHistory();
+      ({ board, hands, sideToMove } = applyMove(board, hands, sideToMove, msg.bestMove));
+      selected = null; selectedDrop = null;
+      afterMove();
+    } else {
+      setStatus("AI: no move");
     }
-  };
+    return;
+  }
+};
 
   worker.onerror = (e) => {
     console.error("worker error:", e);
