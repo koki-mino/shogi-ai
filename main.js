@@ -1,165 +1,18 @@
-/* Shogi NN (TFJS) Demo main.js v3
-   - まず tf.loadGraphModel() で「モデルが読めるか」だけを確定
-   - その後に fetch(model.json) で signature を“表示用に”読む（失敗してもOK）
-   - 入力は 2283 次元（NNUE“風”）を想定
+/* main.js v4 (UI thread)
+   - 探索＋NN推論は worker.js に移動（UI固まらない）
 */
 
-/* ------------------ TFJS Model (GraphModel) ------------------ */
 const MODEL_URL = "./shogi_eval_wars_tfjs/model.json";
+const WORKER_URL = "./worker.js?v=20251217_v4";
 
-let tfModel = null;
-let tfModelStatus = "未読込";
+let worker = null;
+let workerReady = false;
+let workerModelStatus = "未初期化";
+let workerLastInfo = "";
+let thinking = false;
+let lastRequestId = 0;
 
-// ★デフォルト（あなたの model.json で確定している値）
-let tfInputKey = "input_layer_5";        // signature.inputs のキー
-let tfInputTensorName = "input_layer_5:0";
-let tfOutputTensorName = "Identity:0";
-let tfExpectedD = 2283;
-
-function pickFirstKey(obj) {
-  if (!obj) return null;
-  const ks = Object.keys(obj);
-  return ks.length ? ks[0] : null;
-}
-
-async function loadTfModel() {
-  // 1) まず「モデルが読めるか」だけを試す（ここが本命）
-  try {
-    tfModelStatus = "読込中...";
-    setStatus();
-
-    tfModel = await tf.loadGraphModel(MODEL_URL, { fromTFHub: false });
-    tfModelStatus = "読込完了";
-  } catch (e) {
-    console.error(e);
-    tfModelStatus = "読込失敗（手書き評価にフォールバック）: " + (e?.message || e);
-    tfModel = null;
-    setStatus();
-    return;
-  }
-
-  // 2) 次に signature を “表示用に” 読む（失敗してもモデルは使える）
-  try {
-    const meta = await (await fetch(MODEL_URL, { cache: "no-store" })).json();
-    const sigIn = meta?.signature?.inputs || null;
-    const sigOut = meta?.signature?.outputs || null;
-
-    const inKey = pickFirstKey(sigIn);
-    const outKey = pickFirstKey(sigOut);
-
-    if (inKey && sigIn[inKey]) {
-      tfInputKey = inKey;
-      tfInputTensorName = sigIn[inKey].name || tfInputTensorName;
-      const dim = sigIn[inKey]?.tensorShape?.dim || [];
-      const d1 = dim.length >= 2 ? parseInt(dim[1].size, 10) : NaN;
-      if (Number.isFinite(d1)) tfExpectedD = d1;
-    }
-
-    if (outKey && sigOut[outKey]) {
-      tfOutputTensorName = sigOut[outKey].name || tfOutputTensorName;
-    }
-  } catch (e) {
-    // ここで失敗してもOK（表示情報が取れないだけ）
-    console.warn("signature fetch failed (ignored):", e);
-  } finally {
-    setStatus();
-  }
-}
-
-window.addEventListener("load", loadTfModel);
-
-/* ------------------ NNUE“風” encoding (D=2283) ------------------ */
-const NUM_PTYPE = 14;
-const NUM_SQ = 81;
-const HAND_ORDER = ['FU','KY','KE','GI','KI','KA','HI'];
-const D = 1 + (2 * NUM_PTYPE * NUM_SQ) + (2 * HAND_ORDER.length);
-
-// python-shogi の piece_type(1..14) 相当を想定
-const PTYPE_ID = {
-  FU: 1, KY: 2, KE: 3, GI: 4, KI: 5, KA: 6, HI: 7,
-  OU: 8, TO: 9, NY: 10, NK: 11, NG: 12, UM: 13, RY: 14,
-};
-
-// ★sq の並び（まずは仮で y*9+x）
-function sqIndex(x, y) {
-  return y * 9 + x;
-}
-
-function encodePositionForNNUE(board, hands, sideToMove) {
-  const x = new Float32Array(D);
-
-  // 手番（先手=1, 後手=0）
-  x[0] = (sideToMove === 'S') ? 1.0 : 0.0;
-
-  // 盤面 one-hot
-  const base = 1;
-  for (let y = 0; y < 9; y++) for (let x0 = 0; x0 < 9; x0++) {
-    const p = board[y][x0];
-    if (!p) continue;
-
-    const color = (p.side === 'S') ? 0 : 1; // 先手=0, 後手=1
-    const pt = PTYPE_ID[p.type] || 0;       // 1..14
-    if (!pt) continue;
-
-    const sq = sqIndex(x0, y); // 0..80
-    const pidx = pt - 1;       // 0..13
-    const idx = base + ((color * NUM_PTYPE + pidx) * NUM_SQ + sq);
-    x[idx] = 1.0;
-  }
-
-  // 持ち駒（枚数そのまま）
-  const base2 = 1 + (2 * NUM_PTYPE * NUM_SQ);
-  for (let i = 0; i < HAND_ORDER.length; i++) x[base2 + i] = (hands.S[HAND_ORDER[i]] || 0);
-  for (let i = 0; i < HAND_ORDER.length; i++) x[base2 + HAND_ORDER.length + i] = (hands.G[HAND_ORDER[i]] || 0);
-
-  return x;
-}
-
-/* NN推論（先手視点 -1..+1 を返す） */
-function predictSenteValue(feats2283) {
-  if (!tfModel || typeof tf === "undefined") return null;
-  if (tfExpectedD && tfExpectedD !== D) return null;
-
-  let v = null;
-  tf.tidy(() => {
-    const input = tf.tensor(feats2283, [1, D], "float32");
-
-    let out;
-    const dict = { [tfInputKey]: input };
-
-    // GraphModel: execute（同期）でOKなことが多い
-    out = tfOutputTensorName ? tfModel.execute(dict, tfOutputTensorName) : tfModel.execute(dict);
-
-    const y = Array.isArray(out) ? out[0] : out;
-    v = y.dataSync()[0];
-  });
-  return v;
-}
-
-/* ------------------ NN評価（negamax用：手番側から見たスコアを返す） ------------------ */
-const evalCache = new Map(); // key -> score
-
-function evalForSearch(board, hands, sideToMove, useNN) {
-  const fallback = () => materialEval(board, hands) * (sideToMove === 'S' ? 1 : -1);
-
-  if (!useNN || !tfModel || typeof tf === "undefined") return fallback();
-
-  const key = positionKey(board, hands, sideToMove);
-  const cached = evalCache.get(key);
-  if (cached != null) return cached;
-
-  const feats = encodePositionForNNUE(board, hands, sideToMove);
-  const v = predictSenteValue(feats);
-  if (v == null || Number.isNaN(v)) return fallback();
-
-  const senteScore = v * 10000.0;
-  const score = (sideToMove === 'S') ? senteScore : -senteScore;
-
-  evalCache.set(key, score);
-  return score;
-}
-
-/* ------------------ Game State ------------------ */
+/* ------------------ Shogi Model (same as before) ------------------ */
 const PIECE_JA = {FU:"歩",KY:"香",KE:"桂",GI:"銀",KI:"金",KA:"角",HI:"飛",OU:"玉",TO:"と",NY:"杏",NK:"圭",NG:"全",UM:"馬",RY:"龍"};
 const PROM_MAP = {FU:"TO", KY:"NY", KE:"NK", GI:"NG", KA:"UM", HI:"RY"};
 const UNPROM_MAP = {TO:"FU", NY:"KY", NK:"KE", NG:"GI", UM:"KA", RY:"HI"};
@@ -175,29 +28,38 @@ const elHandsS = document.getElementById("handsS");
 const elHandsG = document.getElementById("handsG");
 const elStatus = document.getElementById("status");
 const elDepth = document.getElementById("depth");
+const elTimeMs = document.getElementById("timeMs");
 const elUseNN = document.getElementById("useNN");
 
-document.getElementById("btnReset").onclick = () => resetGame();
-document.getElementById("btnUndo").onclick = () => undo();
-document.getElementById("btnAIMove").onclick = () => aiMove();
+const btnReset = document.getElementById("btnReset");
+const btnUndo = document.getElementById("btnUndo");
+const btnAIMove = document.getElementById("btnAIMove");
+const btnStop = document.getElementById("btnStop");
+
+btnReset.onclick = () => resetGame();
+btnUndo.onclick = () => undo();
+btnAIMove.onclick = () => aiMove();
+btnStop.onclick = () => stopAI();
 
 function setStatus(extra = "") {
   const nn = elUseNN?.checked ? "ON" : "OFF";
   const legal = (board && hands && sideToMove) ? countLegalMoves(board, hands, sideToMove) : 0;
   const chk = (board && sideToMove && isKingInCheck(board, sideToMove)) ? "（王手）" : "";
 
-  const inputInfo = tfInputKey ? `inputKey=${tfInputKey} (${tfInputTensorName || "?"})` : "inputKey=?";
-  const outInfo = tfOutputTensorName ? `output=${tfOutputTensorName}` : "output=?";
+  const w = workerReady ? "ready" : "not-ready";
+  const busy = thinking ? "YES" : "NO";
 
   elStatus.textContent =
 `手番: ${sideToMove || "-"} ${chk}
-NN: ${nn} / モデル: ${tfModelStatus}
-model: ${MODEL_URL}
-${inputInfo}
-${outInfo}
-D(code): ${D} / D(model): ${tfExpectedD || "?"}
+NN: ${nn}
+Worker: ${w} / thinking: ${busy}
+Worker model: ${workerModelStatus}
+${workerLastInfo}
 合法手数: ${legal}
 ${extra}`.trim();
+
+  btnAIMove.disabled = !workerReady || thinking;
+  btnStop.disabled = !thinking;
 }
 
 function render() {
@@ -245,6 +107,9 @@ function renderHands(side, el) {
 }
 
 function onSquareClick(x, y) {
+  if (thinking) return; // 思考中は操作を止めたいならON（外してもOK）
+
+  // drop mode
   if (selectedDrop) {
     if (board[y][x]) return;
     const mv = {from:null, to:{x,y}, drop:selectedDrop, promote:false};
@@ -293,9 +158,7 @@ function onSquareClick(x, y) {
 }
 
 function afterMove() {
-  evalCache.clear();
   render();
-
   const legals = generateLegalMoves(board, hands, sideToMove);
   if (legals.length === 0) {
     const chk = isKingInCheck(board, sideToMove);
@@ -303,7 +166,7 @@ function afterMove() {
   }
 }
 
-/* ------------------ Init ------------------ */
+/* ------------------ Init / Undo ------------------ */
 function resetGame() {
   board = makeEmptyBoard();
   hands = makeEmptyHands();
@@ -312,7 +175,6 @@ function resetGame() {
   selectedDrop = null;
   history = [];
   setupInitialPosition(board);
-  evalCache.clear();
   render();
 }
 function pushHistory() {
@@ -327,10 +189,109 @@ function undo() {
   if (!st) return;
   board = st.board; hands = st.hands; sideToMove = st.side;
   selected = null; selectedDrop = null;
-  evalCache.clear();
   render();
 }
 resetGame();
+
+/* ------------------ Worker ------------------ */
+function initWorker() {
+  worker = new Worker(WORKER_URL);
+  workerReady = false;
+  workerModelStatus = "初期化中...";
+  workerLastInfo = "";
+  setStatus();
+
+  worker.onmessage = (ev) => {
+    const msg = ev.data || {};
+    if (msg.type === "init_done") {
+      workerReady = !!msg.ok;
+      workerModelStatus = msg.ok ? "読込完了" : ("読込失敗: " + (msg.error || ""));
+      workerLastInfo = msg.info ? `info: ${msg.info}` : "";
+      setStatus();
+      return;
+    }
+
+    if (msg.type === "progress") {
+      // 任意：進捗を表示
+      if (thinking) {
+        workerLastInfo = `depth=${msg.depthDone}/${msg.depthMax} best=${msg.bestUci || "-"} score=${(msg.bestScore ?? "").toString()}`;
+        setStatus("AI思考中...");
+      }
+      return;
+    }
+
+    if (msg.type === "result") {
+      if (msg.requestId !== lastRequestId) return; // 古い結果は無視
+      thinking = false;
+
+      if (msg.ok && msg.bestMove) {
+        pushHistory();
+        ({board, hands, sideToMove} = applyMove(board, hands, sideToMove, msg.bestMove));
+        selected = null;
+        selectedDrop = null;
+        afterMove();
+        setStatus(`AI: depth_done=${msg.depthDone} time=${msg.timeMs}ms score=${msg.bestScore}`);
+      } else {
+        setStatus("AI: 結果なし / 中断");
+      }
+      return;
+    }
+
+    if (msg.type === "log") {
+      // console.log("[worker]", msg.message);
+      return;
+    }
+  };
+
+  worker.onerror = (e) => {
+    console.error("worker error:", e);
+    workerReady = false;
+    workerModelStatus = "Workerエラー";
+    setStatus();
+  };
+
+  worker.postMessage({
+    type: "init",
+    modelUrl: MODEL_URL,
+    backend: "wasm" // ここは 'cpu' でもOK
+  });
+}
+initWorker();
+
+function stopAI() {
+  if (!worker || !thinking) return;
+  worker.postMessage({ type: "cancel", requestId: lastRequestId });
+  // UI側も止める（Workerは自前で止まる）
+  thinking = false;
+  setStatus("停止要求を送信しました");
+}
+
+function aiMove() {
+  if (!workerReady || !worker) return;
+
+  const depthMax = Math.max(1, Math.min(10, parseInt(elDepth.value || "4", 10)));
+  const timeMs = Math.max(50, Math.min(5000, parseInt(elTimeMs.value || "500", 10)));
+  const useNN = !!elUseNN.checked;
+
+  thinking = true;
+  lastRequestId++;
+  setStatus("AI思考中...");
+
+  const pos = {
+    board: cloneBoard(board),
+    hands: cloneHands(hands),
+    sideToMove
+  };
+
+  worker.postMessage({
+    type: "think",
+    requestId: lastRequestId,
+    pos,
+    depthMax,
+    timeMs,
+    useNN
+  });
+}
 
 /* ------------------ Board / Hands helpers ------------------ */
 function makeEmptyBoard(){ return Array.from({length:9},()=>Array(9).fill(null)); }
@@ -344,7 +305,7 @@ function cloneHands(h){
   return out;
 }
 function setupInitialPosition(b){
-  const G = 'G', S = 'S';
+  const G='G', S='S';
   b[0][0]={side:G,type:'KY'}; b[0][1]={side:G,type:'KE'}; b[0][2]={side:G,type:'GI'}; b[0][3]={side:G,type:'KI'};
   b[0][4]={side:G,type:'OU'}; b[0][5]={side:G,type:'KI'}; b[0][6]={side:G,type:'GI'}; b[0][7]={side:G,type:'KE'}; b[0][8]={side:G,type:'KY'};
   b[1][1]={side:G,type:'HI'}; b[1][7]={side:G,type:'KA'};
@@ -356,7 +317,7 @@ function setupInitialPosition(b){
   for (let x=0;x<9;x++) b[6][x]={side:S,type:'FU'};
 }
 
-/* ------------------ Moves ------------------ */
+/* ------------------ Moves / Legal generation (same as before) ------------------ */
 function sameFromTo(a, b){
   return a.from && b.from && a.from.x===b.from.x && a.from.y===b.from.y && a.to.x===b.to.x && a.to.y===b.to.y;
 }
@@ -390,13 +351,11 @@ function applyMove(b, h, side, mv){
 
   let newType = fromP.type;
   if (mv.promote) newType = PROM_MAP[fromP.type] || fromP.type;
-
   nb[mv.to.y][mv.to.x] = {side, type: newType};
 
   return {board: nb, hands: nh, sideToMove: opponent(side)};
 }
 
-/* ------------------ Legal move generation ------------------ */
 function generateLegalMoves(b, h, side){
   const moves = [];
 
@@ -427,21 +386,13 @@ function generateLegalMoves(b, h, side){
 }
 function countLegalMoves(b,h,side){ return generateLegalMoves(b,h,side).length; }
 
-function inPromoZone(side, y){
-  return side==='S' ? (y<=2) : (y>=6);
-}
+function inPromoZone(side, y){ return side==='S' ? (y<=2) : (y>=6); }
 function mustPromote(pieceType, side, toY){
-  if (pieceType === 'FU' || pieceType === 'KY') {
-    return side==='S' ? (toY===0) : (toY===8);
-  }
-  if (pieceType === 'KE') {
-    return side==='S' ? (toY<=1) : (toY>=7);
-  }
+  if (pieceType === 'FU' || pieceType === 'KY') return side==='S' ? (toY===0) : (toY===8);
+  if (pieceType === 'KE') return side==='S' ? (toY<=1) : (toY>=7);
   return false;
 }
-function canPromote(pieceType){
-  return !!PROM_MAP[pieceType];
-}
+function canPromote(pieceType){ return !!PROM_MAP[pieceType]; }
 
 function generatePseudoMovesForPiece(b, x, y, p){
   const res = [];
@@ -500,13 +451,10 @@ function generatePseudoMovesForPiece(b, x, y, p){
 
 function pushMoveWithPromo(arr, mv, pieceType, side, fromY, toY){
   if (!canPromote(pieceType)) { arr.push(mv); return; }
-
   const promoPossible = inPromoZone(side, fromY) || inPromoZone(side, toY);
   const forced = mustPromote(pieceType, side, toY);
-
   if (!promoPossible) { arr.push(mv); return; }
   if (forced) { arr.push({...mv, promote:true}); return; }
-
   arr.push({...mv, promote:false});
   arr.push({...mv, promote:true});
 }
@@ -517,7 +465,6 @@ function generateDropMoves(b, h, side){
 
   for (const t of order) {
     if ((h[side][t]||0) <= 0) continue;
-
     for (let y=0;y<9;y++) for (let x=0;x<9;x++) {
       if (b[y][x]) continue;
 
@@ -527,11 +474,9 @@ function generateDropMoves(b, h, side){
       if (t === 'KE') {
         if ((side==='S' && y<=1) || (side==='G' && y>=7)) continue;
       }
-
       if (t === 'FU') {
         if (hasUnpromotedPawnOnFile(b, side, x)) continue;
       }
-
       res.push({from:null, to:{x,y}, drop:t, promote:false});
     }
   }
@@ -557,7 +502,6 @@ function isKingInCheck(b, side){
   const k = findKing(b, side);
   if (!k) return false;
   const foe = opponent(side);
-
   for (let y=0;y<9;y++) for (let x=0;x<9;x++){
     const p=b[y][x];
     if (!p || p.side!==foe) continue;
@@ -602,120 +546,4 @@ function attacksSquare(b, x, y, p, tx, ty){
              step(1,1)||step(1,-1)||step(-1,1)||step(-1,-1);
   }
   return false;
-}
-
-/* ------------------ Evaluation fallback ------------------ */
-const VALUE = {FU:100,KY:300,KE:300,GI:400,KI:500,KA:700,HI:800,OU:0,TO:500,NY:500,NK:500,NG:500,UM:900,RY:1000};
-function materialEval(b,h){
-  let s=0;
-  for (let y=0;y<9;y++) for (let x=0;x<9;x++){
-    const p=b[y][x]; if (!p) continue;
-    const v = VALUE[p.type]||0;
-    s += (p.side==='S') ? v : -v;
-  }
-  for (const side of ['S','G']){
-    for (const t of ['FU','KY','KE','GI','KI','KA','HI']){
-      const v = VALUE[t]||0;
-      const n = h[side][t]||0;
-      s += (side==='S') ? v*n : -v*n;
-    }
-  }
-  return s;
-}
-
-/* ------------------ Search (negamax + alpha-beta) ------------------ */
-function positionKey(b,h,side){
-  let s = side + "|";
-  for (let y=0;y<9;y++) for (let x=0;x<9;x++){
-    const p=b[y][x];
-    if (!p) s += ".";
-    else s += (p.side==='S'?"S":"G")+p.type;
-    s += ",";
-  }
-  s += "|";
-  for (const sd of ['S','G']){
-    s += sd + ":";
-    for (const t of ['FU','KY','KE','GI','KI','KA','HI']) s += (h[sd][t]||0)+".";
-    s += "|";
-  }
-  return s;
-}
-
-// 簡易の手順序
-function orderMoves(b,h,side,moves){
-  const foe = opponent(side);
-  const scored = moves.map(mv => {
-    let sc = 0;
-    if (!mv.drop) {
-      const tp = b[mv.to.y][mv.to.x];
-      if (tp) sc += (VALUE[tp.type] || 0) + 200;
-      if (mv.promote) sc += 150;
-    } else {
-      sc += 20;
-    }
-    const st = applyMove(b,h,side,mv);
-    if (isKingInCheck(st.board, foe)) sc += 400;
-    return {mv, sc};
-  });
-  scored.sort((a,b)=>b.sc-a.sc);
-  return scored.map(x=>x.mv);
-}
-
-function chooseBestMove(b,h,side,depth,useNN){
-  let moves = generateLegalMoves(b,h,side);
-  if (moves.length===0) return null;
-  moves = orderMoves(b,h,side,moves);
-
-  let best = moves[0];
-  let bestScore = -Infinity;
-  let alpha = -Infinity, beta = Infinity;
-
-  for (const mv of moves){
-    const st = applyMove(b,h,side,mv);
-    const score = -negamax(st.board, st.hands, st.sideToMove, depth-1, -beta, -alpha, useNN);
-    if (score > bestScore){
-      bestScore = score; best = mv;
-    }
-    if (score > alpha) alpha = score;
-  }
-  return {move: best, score: bestScore};
-}
-
-function negamax(b,h,side,depth,alpha,beta,useNN){
-  let legals = generateLegalMoves(b,h,side);
-  if (legals.length===0){
-    if (isKingInCheck(b,side)) return -999999;
-    return 0;
-  }
-  if (depth<=0){
-    return evalForSearch(b,h,side,useNN);
-  }
-
-  legals = orderMoves(b,h,side,legals);
-
-  let best = -Infinity;
-  for (const mv of legals){
-    const st = applyMove(b,h,side,mv);
-    const score = -negamax(st.board, st.hands, st.sideToMove, depth-1, -beta, -alpha, useNN);
-    if (score > best) best = score;
-    if (score > alpha) alpha = score;
-    if (alpha >= beta) break;
-  }
-  return best;
-}
-
-/* ------------------ AI Move ------------------ */
-function aiMove(){
-  const depth = Math.max(1, Math.min(7, parseInt(elDepth.value||"3",10)));
-  const useNN = !!elUseNN.checked;
-
-  setStatus("AI思考中...");
-  setTimeout(() => {
-    const r = chooseBestMove(board, hands, sideToMove, depth, useNN);
-    if (!r) return;
-    pushHistory();
-    ({board, hands, sideToMove} = applyMove(board, hands, sideToMove, r.move));
-    selected = null; selectedDrop = null;
-    afterMove();
-  }, 30);
 }
