@@ -3,7 +3,7 @@
 */
 
 const MODEL_URL = "./shogi_eval_wars_tfjs/model.json";
-const WORKER_URL = "./worker.js?v=20251217_v5";
+const WORKER_URL = "./worker.js?v=20251217_v6";
 
 let worker = null;
 let workerReady = false;
