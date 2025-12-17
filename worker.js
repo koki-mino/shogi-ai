@@ -1,9 +1,9 @@
-/* worker.js (vTT1)
-   - TFJS model load in Worker
-   - Iterative deepening + Aspiration window
-   - NN eval cache
-   - Move ordering 강화: TT move first, captures (MVV-LVA), promotions, checks, killer, history
-   - Transposition Table (TT): depth-bound, exact/lower/upper
+/* worker.js (vTT2)
+   Fixes vs vTT1:
+   - history/killer の side を正しく current side で更新/参照（逆だったのを修正）
+   - root 局面も TT に保存（反復深化のPV安定＆ordering改善）
+   - timeup で stop した探索結果を TT に書き込まない（汚染防止）
+   - uchi-fuzume判定用の hasAnyLegalMoveCurrentSide の途中打ち切りを廃止（誤判定減）
 
    Protocol:
      main -> worker:
@@ -26,13 +26,10 @@ let backendName = "cpu";
 
 async function initTf(modelUrl, backend) {
   try {
-    // TFJS core
     importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js");
 
-    // backend
     if (backend === "wasm") {
       importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js");
-      // wasm binaries path
       if (tf?.wasm?.setWasmPaths) {
         tf.wasm.setWasmPaths("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/");
       }
@@ -66,18 +63,6 @@ async function initTf(modelUrl, backend) {
 }
 
 /* ------------------ Shogi internal representation ------------------ */
-/*
-  boardA[sq] : Int16
-    0 = empty
-    +ptype (1..14) = S piece
-    -ptype (1..14) = G piece
-
-  sideSign : +1 (S to move) / -1 (G to move)
-
-  piece types (match python-shogi piece_type 1..14 order):
-    1 FU, 2 KY, 3 KE, 4 GI, 5 KI, 6 KA, 7 HI, 8 OU,
-    9 TO, 10 NY, 11 NK, 12 NG, 13 UM, 14 RY
-*/
 const PTYPE = {
   FU: 1, KY: 2, KE: 3, GI: 4, KI: 5, KA: 6, HI: 7, OU: 8,
   TO: 9, NY: 10, NK: 11, NG: 12, UM: 13, RY: 14,
@@ -87,7 +72,7 @@ const PNAME = {
   9:"TO",10:"NY",11:"NK",12:"NG",13:"UM",14:"RY"
 };
 
-const HAND_ORDER = [PTYPE.FU, PTYPE.KY, PTYPE.KE, PTYPE.GI, PTYPE.KI, PTYPE.KA, PTYPE.HI]; // 7
+const HAND_ORDER = [PTYPE.FU, PTYPE.KY, PTYPE.KE, PTYPE.GI, PTYPE.KI, PTYPE.KA, PTYPE.HI];
 const HAND_IDX = new Map([[1,0],[2,1],[3,2],[4,3],[5,4],[6,5],[7,6]]);
 
 const PROM = new Int8Array(15);
@@ -106,47 +91,34 @@ UNPROM[PTYPE.NG] = PTYPE.GI;
 UNPROM[PTYPE.UM] = PTYPE.KA;
 UNPROM[PTYPE.RY] = PTYPE.HI;
 
-function baseTypeOf(pt) {
-  return UNPROM[pt] ? UNPROM[pt] : pt;
-}
+function baseTypeOf(pt) { return UNPROM[pt] ? UNPROM[pt] : pt; }
 function sideIdxFromSign(sign){ return sign === 1 ? 0 : 1; }
-function oppSign(sign){ return -sign; }
 function sqX(sq){ return sq % 9; }
 function sqY(sq){ return (sq / 9) | 0; }
 function sqIndex(x,y){ return y*9 + x; }
 function inside(x,y){ return x>=0 && x<9 && y>=0 && y<9; }
 
-function inPromoZone(sign, y){
-  // S: y<=2, G: y>=6
-  return (sign === 1) ? (y <= 2) : (y >= 6);
-}
+function inPromoZone(sign, y){ return (sign === 1) ? (y <= 2) : (y >= 6); }
 function mustPromote(pt, sign, toY){
-  if (pt === PTYPE.FU || pt === PTYPE.KY) {
-    return (sign===1) ? (toY===0) : (toY===8);
-  }
-  if (pt === PTYPE.KE) {
-    return (sign===1) ? (toY<=1) : (toY>=7);
-  }
+  if (pt === PTYPE.FU || pt === PTYPE.KY) return (sign===1) ? (toY===0) : (toY===8);
+  if (pt === PTYPE.KE) return (sign===1) ? (toY<=1) : (toY>=7);
   return false;
 }
-function canPromote(pt){
-  return PROM[pt] !== 0;
-}
+function canPromote(pt){ return PROM[pt] !== 0; }
 
-/* ------------------ Values (ordering / fallback) ------------------ */
+/* ------------------ Values ------------------ */
 const VALUE = new Int32Array(15);
 VALUE[PTYPE.FU]=100; VALUE[PTYPE.KY]=300; VALUE[PTYPE.KE]=300; VALUE[PTYPE.GI]=400; VALUE[PTYPE.KI]=500;
 VALUE[PTYPE.KA]=700; VALUE[PTYPE.HI]=800; VALUE[PTYPE.OU]=0;
 VALUE[PTYPE.TO]=500; VALUE[PTYPE.NY]=500; VALUE[PTYPE.NK]=500; VALUE[PTYPE.NG]=500;
 VALUE[PTYPE.UM]=900; VALUE[PTYPE.RY]=1000;
 
-/* ------------------ Zobrist (for TT / eval cache) ------------------ */
+/* ------------------ Zobrist ------------------ */
 let Z_PIECE = null; // [2][15][81] BigInt
-let Z_HAND  = null; // [2][7][20] BigInt (count 0..19)
+let Z_HAND  = null; // [2][7][20] BigInt
 let Z_SIDE  = 0n;
 
 function splitmix64(seed) {
-  // returns [nextSeed, rand64BigInt]
   let x = BigInt.asUintN(64, seed + 0x9E3779B97F4A7C15n);
   seed = x;
   x = BigInt.asUintN(64, (x ^ (x >> 30n)) * 0xBF58476D1CE4E5B9n);
@@ -182,16 +154,14 @@ function initZobrist() {
 }
 initZobrist();
 
-/* ------------------ State (in worker) ------------------ */
+/* ------------------ State ------------------ */
 let boardA = new Int16Array(81);
 let handsA = [new Int16Array(7), new Int16Array(7)]; // [S][7], [G][7]
 let sideSign = 1; // +1 S, -1 G
 let hashKey = 0n;
 
-// undo stack
 const undoStack = [];
 
-/* build hash from scratch */
 function computeHash() {
   let h = 0n;
   for (let sq=0;sq<81;sq++){
@@ -208,33 +178,20 @@ function computeHash() {
       h ^= Z_HAND[s][i][cc];
     }
   }
-  if (sideSign === -1) h ^= Z_SIDE; // side bit
+  if (sideSign === -1) h ^= Z_SIDE;
   return h;
 }
 
 /* ------------------ Move encoding ------------------ */
-/*
-  move object:
-    {fromSq, toSq, dropPt(0|1..7), promote(0|1), movedPt, capturedPiece, givesCheck, key}
-*/
 function moveKey(mv){
-  if (mv.dropPt) {
-    // 0x80000000 | (dropPt<<16) | to
-    return (0x80000000 | (mv.dropPt << 16) | (mv.toSq & 0xFF)) >>> 0;
-  }
-  // (from<<16) | to | (promote<<30)
+  if (mv.dropPt) return (0x80000000 | (mv.dropPt << 16) | (mv.toSq & 0xFF)) >>> 0;
   return (((mv.fromSq & 0xFF) << 16) | (mv.toSq & 0xFF) | ((mv.promote?1:0) << 30)) >>> 0;
 }
-function sameMoveKey(aKey, bKey){ return aKey === bKey; }
-
 function mvToBestStr(mv){
   const pad2 = (n)=> String(n).padStart(2,"0");
-  if (mv.dropPt){
-    return `D${PNAME[mv.dropPt] || mv.dropPt}${pad2(mv.toSq)}`;
-  }
+  if (mv.dropPt) return `D${PNAME[mv.dropPt] || mv.dropPt}${pad2(mv.toSq)}`;
   return `${pad2(mv.fromSq)}${pad2(mv.toSq)}${mv.promote?"+":""}`;
 }
-
 function mvToUI(mv){
   const to = { x: sqX(mv.toSq), y: sqY(mv.toSq) };
   if (mv.dropPt){
@@ -244,7 +201,7 @@ function mvToUI(mv){
   return { from, to, drop: null, promote: !!mv.promote };
 }
 
-/* ------------------ Make / Unmake (in-place) ------------------ */
+/* ------------------ Make / Unmake ------------------ */
 function xorHandCount(sign, handIdx, oldC, newC){
   const s = sideIdxFromSign(sign);
   const o = Math.max(0, Math.min(19, oldC));
@@ -254,7 +211,6 @@ function xorHandCount(sign, handIdx, oldC, newC){
 }
 
 function makeMove(mv){
-  // store undo
   const u = {
     fromSq: mv.fromSq,
     toSq: mv.toSq,
@@ -262,7 +218,7 @@ function makeMove(mv){
     promote: mv.promote,
     movedPiece: 0,
     capturedPiece: 0,
-    addedHandIdx: -1, // if capture adds to hand
+    addedHandIdx: -1,
     prevSide: sideSign,
     prevHash: hashKey,
   };
@@ -270,20 +226,16 @@ function makeMove(mv){
   const sIdx = sideIdxFromSign(sideSign);
 
   if (mv.dropPt){
-    // drop from hand
     const hidx = HAND_IDX.get(mv.dropPt);
     const oldC = handsA[sIdx][hidx];
     const newC = oldC - 1;
     handsA[sIdx][hidx] = newC;
     xorHandCount(sideSign, hidx, oldC, newC);
 
-    // place on board
     const toSq = mv.toSq;
-    // empty assumed
     boardA[toSq] = sideSign * mv.dropPt;
     hashKey ^= Z_PIECE[sIdx][mv.dropPt][toSq];
 
-    // flip side
     sideSign = -sideSign;
     hashKey ^= Z_SIDE;
 
@@ -324,7 +276,7 @@ function makeMove(mv){
     }
   }
 
-  // place moved to toSq (maybe promoted)
+  // place moved on toSq
   let newPt = Math.abs(moved);
   if (mv.promote){
     const p = PROM[newPt];
@@ -333,7 +285,6 @@ function makeMove(mv){
   boardA[toSq] = sideSign * newPt;
   hashKey ^= Z_PIECE[sIdx][newPt][toSq];
 
-  // flip side
   sideSign = -sideSign;
   hashKey ^= Z_SIDE;
 
@@ -344,26 +295,20 @@ function unmakeMove(){
   const u = undoStack.pop();
   if (!u) return;
 
-  // restore whole hash fast
   sideSign = u.prevSide;
   hashKey = u.prevHash;
 
   if (u.dropPt){
-    // remove dropped piece from board
     boardA[u.toSq] = 0;
-
-    // restore hand count (+1 back)
     const sIdx = sideIdxFromSign(sideSign);
     const hidx = HAND_IDX.get(u.dropPt);
     handsA[sIdx][hidx] += 1;
     return;
   }
 
-  // restore pieces
   boardA[u.fromSq] = u.movedPiece;
   boardA[u.toSq] = u.capturedPiece;
 
-  // restore hands if capture happened
   if (u.capturedPiece && u.addedHandIdx >= 0){
     const sIdx = sideIdxFromSign(sideSign);
     handsA[sIdx][u.addedHandIdx] -= 1;
@@ -382,8 +327,7 @@ function findKingSq(sign){
 function attacksSquare(fromSq, pAbs, pSign, targetSq){
   const fx = sqX(fromSq), fy = sqY(fromSq);
   const tx = sqX(targetSq), ty = sqY(targetSq);
-
-  const dir = (pSign === 1) ? -1 : 1; // forward y
+  const dir = (pSign === 1) ? -1 : 1;
 
   const step = (dx,dy) => (fx+dx===tx && fy+dy===ty);
   const slide = (dx,dy) => {
@@ -433,13 +377,14 @@ function isKingInCheck(sign){
   for (let sq=0;sq<81;sq++){
     const p = boardA[sq];
     if (!p) continue;
-    if ((p > 0 ? 1 : -1) !== foe) continue;
+    const ps = p > 0 ? 1 : -1;
+    if (ps !== foe) continue;
     if (attacksSquare(sq, Math.abs(p), foe, ksq)) return true;
   }
   return false;
 }
 
-/* ------------------ Move generation (legal) ------------------ */
+/* ------------------ Move generation ------------------ */
 function hasUnpromotedPawnOnFile(sign, fileX){
   const pawn = sign * PTYPE.FU;
   for (let y=0;y<9;y++){
@@ -458,7 +403,6 @@ function pushMoveWithPromo(moves, fromSq, toSq, ptAbs, promotePossible, forced){
     moves.push({fromSq, toSq, dropPt:0, promote:1, movedPt:ptAbs, capturedPiece:boardA[toSq], givesCheck:false, key:0});
     return;
   }
-  // both
   moves.push({fromSq, toSq, dropPt:0, promote:0, movedPt:ptAbs, capturedPiece:boardA[toSq], givesCheck:false, key:0});
   moves.push({fromSq, toSq, dropPt:0, promote:1, movedPt:ptAbs, capturedPiece:boardA[toSq], givesCheck:false, key:0});
 }
@@ -535,11 +479,8 @@ function genDropMoves(moves, sign){
       if (boardA[sq]) continue;
       const x = sqX(sq), y = sqY(sq);
 
-      // cannot drop on last ranks
       if ((pt===PTYPE.FU || pt===PTYPE.KY) && ((sign===1 && y===0) || (sign===-1 && y===8))) continue;
       if (pt===PTYPE.KE && ((sign===1 && y<=1) || (sign===-1 && y>=7))) continue;
-
-      // nifu
       if (pt===PTYPE.FU && hasUnpromotedPawnOnFile(sign, x)) continue;
 
       moves.push({fromSq:-1, toSq:sq, dropPt:pt, promote:0, movedPt:pt, capturedPiece:0, givesCheck:false, key:0});
@@ -547,10 +488,10 @@ function genDropMoves(moves, sign){
   }
 }
 
+/* uchi-fuzume 判定用（簡易、でも途中打ち切りはしない） */
 function hasAnyLegalMoveCurrentSide(){
   const sign = sideSign;
 
-  // pseudo list, stop at first legal
   const pseudo = [];
   for (let sq=0;sq<81;sq++){
     const p = boardA[sq];
@@ -558,19 +499,15 @@ function hasAnyLegalMoveCurrentSide(){
     const ps = p > 0 ? 1 : -1;
     if (ps !== sign) continue;
     genPseudoMovesForPiece(pseudo, sq, Math.abs(p), ps);
-    if (pseudo.length > 128) break; // enough; still safe
   }
   genDropMoves(pseudo, sign);
 
   for (let i=0;i<pseudo.length;i++){
     const mv = pseudo[i];
     makeMove(mv);
-    const ok = !isKingInCheck(-sideSign); // after makeMove, sideSign flipped. need original sign -> now -sideSign
-    if (ok){
-      unmakeMove();
-      return true;
-    }
+    const ok = !isKingInCheck(-sideSign); // original sign = -sideSign
     unmakeMove();
+    if (ok) return true;
   }
   return false;
 }
@@ -592,22 +529,17 @@ function generateLegalMovesForCurrentSide() {
     const mv = pseudo[i];
 
     makeMove(mv);
-    // after makeMove, sideSign flipped (opponent to move).
-    // legality: our king (original sign) must not be in check
-    const illegal = isKingInCheck(-sideSign); // original sign = -sideSign
+    const illegal = isKingInCheck(-sideSign);
     if (illegal){
       unmakeMove();
       continue;
     }
 
-    // givesCheck?
-    const gives = isKingInCheck(sideSign); // opponent king in check? (opponent sign = sideSign)
+    const gives = isKingInCheck(sideSign);
     mv.givesCheck = gives;
 
-    // uchi-fuzume simple (pawn drop checkmate)
     if (mv.dropPt === PTYPE.FU && gives){
-      // if opponent has no legal move => illegal
-      const any = hasAnyLegalMoveCurrentSide(); // current side is opponent now (sideSign)
+      const any = hasAnyLegalMoveCurrentSide();
       if (!any){
         unmakeMove();
         continue;
@@ -623,8 +555,7 @@ function generateLegalMovesForCurrentSide() {
 }
 
 /* ------------------ NN Encode (D=2283) ------------------ */
-const NUM_PTYPE = 14;
-const NUM_SQ = 81;
+const NUM_PTYPE = 14, NUM_SQ = 81;
 const D = 1 + (2 * NUM_PTYPE * NUM_SQ) + (2 * 7); // 2283
 
 function encodeToFloat32() {
@@ -635,14 +566,13 @@ function encodeToFloat32() {
   for (let sq=0;sq<81;sq++){
     const p = boardA[sq];
     if (!p) continue;
-    const color = (p > 0) ? 0 : 1; // S=0, G=1
-    const pidx = Math.abs(p) - 1; // 0..13
+    const color = (p > 0) ? 0 : 1;
+    const pidx = Math.abs(p) - 1;
     const idx = base + (color * NUM_PTYPE + pidx) * NUM_SQ + sq;
     x[idx] = 1.0;
   }
 
   const base2 = 1 + (2 * NUM_PTYPE * NUM_SQ);
-  // S hands then G hands
   for (let i=0;i<7;i++){
     x[base2 + i] = handsA[0][i];
     x[base2 + 7 + i] = handsA[1][i];
@@ -650,25 +580,23 @@ function encodeToFloat32() {
   return x;
 }
 
-/* ------------------ Eval (NN / fallback) + cache ------------------ */
-const evalCache = new Map(); // hashKey(BigInt) -> score (side-to-move perspective)
+/* ------------------ Eval + cache ------------------ */
+const evalCache = new Map(); // BigInt -> score (side-to-move)
 const EVAL_CACHE_MAX = 50000;
 
 function materialFallbackScore(){
-  // score from side-to-move perspective
   let s = 0;
   for (let sq=0;sq<81;sq++){
     const p = boardA[sq];
     if (!p) continue;
     const pt = Math.abs(p);
     const v = VALUE[pt] || 0;
-    s += (p > 0) ? v : -v; // S view
+    s += (p > 0) ? v : -v;
   }
   for (let i=0;i<7;i++){
     s += handsA[0][i] * (VALUE[HAND_ORDER[i]]||0);
     s -= handsA[1][i] * (VALUE[HAND_ORDER[i]]||0);
   }
-  // convert to side-to-move view
   return (sideSign === 1) ? s : -s;
 }
 
@@ -681,7 +609,6 @@ function evalScore(useNN){
   if (useNN && tfReady && model) {
     try {
       const feats = encodeToFloat32();
-      // model output is assumed to be "side-to-move" value in [-1,1]
       let v = 0;
       tf.tidy(() => {
         const t = tf.tensor(feats, [1, D], "float32");
@@ -696,65 +623,51 @@ function evalScore(useNN){
     score = materialFallbackScore();
   }
 
-  // cache bound
   if (evalCache.size > EVAL_CACHE_MAX) evalCache.clear();
   evalCache.set(key, score);
   return score;
 }
 
-/* ------------------ TT (Transposition Table) ------------------ */
+/* ------------------ TT ------------------ */
 const TT = new Map(); // BigInt -> entry
 const TT_MAX = 200000;
 
-const TT_EXACT = 0;
-const TT_LOWER = 1;
-const TT_UPPER = 2;
-
+const TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
 let searchGen = 0;
 
-function ttGet(key){
-  return TT.get(key);
-}
+function ttGet(key){ return TT.get(key); }
 function ttPut(key, entry){
   if (TT.size > TT_MAX) TT.clear();
   TT.set(key, entry);
 }
 
-/* ------------------ Move ordering heuristics ------------------ */
+/* ------------------ Move ordering ------------------ */
 const killer1 = new Uint32Array(128);
 const killer2 = new Uint32Array(128);
-// history[sideIdx][from*81+to] : bonus
 const historyH = [new Int32Array(81*81), new Int32Array(81*81)];
-
-function isCapture(mv){ return mv.capturedPiece !== 0; }
 
 function orderScoreForMove(mv, ply, ttMoveKey){
   let s = 0;
 
-  // TT move first
-  if (ttMoveKey !== 0 && sameMoveKey(mv.key, ttMoveKey)) s += 1_000_000_000;
+  if (ttMoveKey !== 0 && mv.key === ttMoveKey) s += 1_000_000_000;
 
-  // captures: MVV-LVA style
   if (mv.capturedPiece){
     const capPt = Math.abs(mv.capturedPiece);
     const mvPt = mv.movedPt;
     s += 200_000 + (VALUE[capPt]||0) * 10 - (VALUE[mvPt]||0);
   }
 
-  // promote
   if (!mv.dropPt && mv.promote) s += 20_000;
-
-  // gives check
   if (mv.givesCheck) s += 15_000;
 
-  // killers (quiet moves)
-  if (!mv.capturedPiece && !mv.dropPt) {
+  // quiet ordering
+  if (!mv.capturedPiece) {
     if (mv.key === killer1[ply]) s += 12_000;
     else if (mv.key === killer2[ply]) s += 8_000;
 
-    // history
-    const sIdx = sideIdxFromSign(-sideSign); // careful: during ordering, sideSign is current. we are scoring for current side.
-    const from = mv.fromSq >= 0 ? mv.fromSq : mv.toSq; // drop uses toSq
+    // ✅ FIX: current side の history を参照
+    const sIdx = sideIdxFromSign(sideSign);
+    const from = (mv.fromSq >= 0 ? mv.fromSq : mv.toSq);
     const to = mv.toSq;
     s += historyH[sIdx][from*81 + to] | 0;
   }
@@ -763,8 +676,7 @@ function orderScoreForMove(mv, ply, ttMoveKey){
 }
 
 function updateKillersAndHistory(mv, ply, depth){
-  // update on beta cutoff
-  if (mv.capturedPiece || mv.dropPt) return; // quiet only for killer/history
+  if (mv.capturedPiece) return; // quiet only
   const key = mv.key;
 
   if (killer1[ply] !== key){
@@ -772,31 +684,30 @@ function updateKillersAndHistory(mv, ply, depth){
     killer1[ply] = key;
   }
 
-  const sIdx = sideIdxFromSign(-sideSign); // current side before makeMove
-  const from = mv.fromSq;
+  // ✅ FIX: current side の history を更新
+  const sIdx = sideIdxFromSign(sideSign);
+  const from = (mv.fromSq >= 0 ? mv.fromSq : mv.toSq);
   const to = mv.toSq;
-  if (from >= 0){
-    const idx = from*81 + to;
-    historyH[sIdx][idx] += depth * depth;
-    if (historyH[sIdx][idx] > 1_000_000) historyH[sIdx].fill(0); // prevent overflow
-  }
+
+  const idx = from*81 + to;
+  historyH[sIdx][idx] += depth * depth;
+  if (historyH[sIdx][idx] > 2_000_000) historyH[sIdx].fill(0);
 }
 
-/* ------------------ Search (alpha-beta + TT + aspiration) ------------------ */
+/* ------------------ Search ------------------ */
 let stop = false;
 let tStart = 0;
 let tLimit = 0;
 let nodes = 0;
 
-function timeUp(){
-  return (performance.now() - tStart) >= tLimit;
-}
+function timeUp(){ return (performance.now() - tStart) >= tLimit; }
 
 const INF = 1e15;
 const MATE = 1_000_000;
 
 function negamax(depth, alpha, beta, ply, useNN){
   if (stop) return 0;
+
   if ((nodes & 2047) === 0 && timeUp()){
     stop = true;
     return 0;
@@ -805,9 +716,7 @@ function negamax(depth, alpha, beta, ply, useNN){
 
   const alpha0 = alpha;
 
-  // TT probe
-  const key = hashKey;
-  const ent = ttGet(key);
+  const ent = ttGet(hashKey);
   let ttMoveKey = 0;
   if (ent){
     ttMoveKey = ent.bestKey || 0;
@@ -820,19 +729,14 @@ function negamax(depth, alpha, beta, ply, useNN){
     }
   }
 
-  // generate legal
   const legals = generateLegalMovesForCurrentSide();
   if (legals.length === 0){
-    // checkmate/stalemate
     if (isKingInCheck(sideSign)) return -MATE + ply;
     return 0;
   }
 
-  if (depth <= 0){
-    return evalScore(useNN);
-  }
+  if (depth <= 0) return evalScore(useNN);
 
-  // order moves
   for (let i=0;i<legals.length;i++){
     legals[i]._ord = orderScoreForMove(legals[i], ply, ttMoveKey);
   }
@@ -856,37 +760,32 @@ function negamax(depth, alpha, beta, ply, useNN){
 
     if (v > alpha) alpha = v;
     if (alpha >= beta){
-      // beta cutoff
       updateKillersAndHistory(mv, ply, depth);
       break;
     }
   }
 
-  // TT store
+  // ✅ stop 中は TT に書かない（汚染防止）
+  if (stop) return bestVal;
+
   let flag = TT_EXACT;
   if (bestVal <= alpha0) flag = TT_UPPER;
   else if (bestVal >= beta) flag = TT_LOWER;
 
-  ttPut(key, {
-    depth,
-    flag,
-    value: bestVal,
-    bestKey,
-    gen: searchGen,
-  });
-
+  ttPut(hashKey, { depth, flag, value: bestVal, bestKey, gen: searchGen });
   return bestVal;
 }
 
 function searchRoot(depth, alpha, beta, useNN){
+  const rootKey = hashKey;
+
   const legals = generateLegalMovesForCurrentSide();
   if (legals.length === 0){
     if (isKingInCheck(sideSign)) return {score: -MATE, best:null};
     return {score: 0, best:null};
   }
 
-  // TT best at root
-  const ent = ttGet(hashKey);
+  const ent = ttGet(rootKey);
   const ttMoveKey = ent?.bestKey || 0;
 
   for (let i=0;i<legals.length;i++){
@@ -899,7 +798,6 @@ function searchRoot(depth, alpha, beta, useNN){
 
   for (let i=0;i<legals.length;i++){
     const mv = legals[i];
-
     makeMove(mv);
     const v = -negamax(depth-1, -beta, -alpha, 1, useNN);
     unmakeMove();
@@ -911,6 +809,11 @@ function searchRoot(depth, alpha, beta, useNN){
       best = mv;
     }
     if (v > alpha) alpha = v;
+  }
+
+  // ✅ stop 中は root TT も書かない
+  if (!stop && best){
+    ttPut(rootKey, { depth, flag: TT_EXACT, value: bestScore, bestKey: best.key, gen: searchGen });
   }
 
   return {score: bestScore, best};
@@ -929,42 +832,36 @@ function thinkIterative(depthMax, timeMs, useNN, requestId){
   let bestScore = 0;
   let depthDone = 0;
 
-  // aspiration params
   let prev = 0;
-  let window = 250; // initial aspiration window
+  let window = 250;
 
   for (let d=1; d<=depthMax; d++){
     if (timeUp()){ stop = true; break; }
 
     let a = -INF, b = INF;
-
     if (d >= 2){
       a = prev - window;
       b = prev + window;
     }
 
-    // aspiration loop
     let result;
     while (true){
       result = searchRoot(d, a, b, useNN);
       if (stop) break;
 
       const s = result.score;
-
       if (d < 2) break;
 
       if (s <= a){
-        // fail-low
-        a = -INF;
         window *= 2;
+        a = -INF;
         b = prev + window;
         continue;
       }
       if (s >= b){
-        // fail-high
-        b = INF;
         window *= 2;
         a = prev - window;
+        b = INF;
         continue;
       }
       break;
@@ -989,7 +886,6 @@ function thinkIterative(depthMax, timeMs, useNN, requestId){
         partial: true,
       });
     } else {
-      // no best move
       break;
     }
   }
@@ -1011,15 +907,12 @@ function thinkIterative(depthMax, timeMs, useNN, requestId){
 
 /* ------------------ Load position from main ------------------ */
 function loadPos(pos){
-  // board
   boardA.fill(0);
   handsA[0].fill(0);
   handsA[1].fill(0);
 
-  // side
   sideSign = (pos.sideToMove === "S") ? 1 : -1;
 
-  // board[y][x]
   for (let y=0;y<9;y++){
     for (let x=0;x<9;x++){
       const p = pos.board?.[y]?.[x];
@@ -1027,15 +920,11 @@ function loadPos(pos){
       const pt = PTYPE[p.type] || 0;
       if (!pt) continue;
       const s = (p.side === "S") ? 1 : -1;
-      const sq = sqIndex(x,y);
-      boardA[sq] = s * pt;
+      boardA[sqIndex(x,y)] = s * pt;
     }
   }
 
-  // hands
   const hs = pos.hands || {};
-  const hS = hs.S || {};
-  const hG = hs.G || {};
   const fillHand = (arr, hObj) => {
     arr[0] = (hObj.FU|0) || 0;
     arr[1] = (hObj.KY|0) || 0;
@@ -1045,10 +934,9 @@ function loadPos(pos){
     arr[5] = (hObj.KA|0) || 0;
     arr[6] = (hObj.HI|0) || 0;
   };
-  fillHand(handsA[0], hS);
-  fillHand(handsA[1], hG);
+  fillHand(handsA[0], hs.S || {});
+  fillHand(handsA[1], hs.G || {});
 
-  // hash
   hashKey = computeHash();
   undoStack.length = 0;
 }
@@ -1062,11 +950,8 @@ self.onmessage = async (e) => {
     const backend = msg.backend || "wasm";
 
     const r = await initTf(modelUrl, backend);
-    if (r.ok) {
-      postMessage({ type:"init_done", ok:true, info: modelInfo });
-    } else {
-      postMessage({ type:"init_done", ok:false, error: r.error || "init failed" });
-    }
+    if (r.ok) postMessage({ type:"init_done", ok:true, info: modelInfo });
+    else postMessage({ type:"init_done", ok:false, error: r.error || "init failed" });
     return;
   }
 
@@ -1076,9 +961,7 @@ self.onmessage = async (e) => {
     const timeMs = Math.max(50, msg.timeMs|0);
     const useNN = !!msg.useNN;
 
-    // (optional) clear evalCache each think to avoid memory growth / stale
     evalCache.clear();
-
     loadPos(msg.pos);
 
     const r = thinkIterative(depthMax, timeMs, useNN, requestId);
