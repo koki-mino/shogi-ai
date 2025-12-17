@@ -1,1126 +1,1101 @@
-/* worker.js v9
-   - TT(Zobrist) + make/unmake
-   - Killer/History move ordering
-   - Quiescence search
-   - NN evaluation cache (EvalTT)
-   - Aspiration Window at root (iterative deepening)
-   - PVS (null-window search)
-   - LMR (Late Move Reductions)
-   - bestStr を progress/result に同梱（main.js側で best=- 解消）
+/* worker.js (vTT1)
+   - TFJS model load in Worker
+   - Iterative deepening + Aspiration window
+   - NN eval cache
+   - Move ordering 강화: TT move first, captures (MVV-LVA), promotions, checks, killer, history
+   - Transposition Table (TT): depth-bound, exact/lower/upper
+
+   Protocol:
+     main -> worker:
+       {type:"init", modelUrl, backend:"wasm"|"cpu"}
+       {type:"think", requestId, depthMax, timeMs, useNN, pos:{board,hands,sideToMove}}
+
+     worker -> main:
+       {type:"init_done", ok, info, error}
+       {type:"progress", requestId, depthDone, depthMax, bestMove, bestStr, bestScore, partial}
+       {type:"result", requestId, ok, depthDone, depthMax, bestMove, bestStr, bestScore, timeMs, partial, nodes}
 */
 
-let tf = null;
+"use strict";
+
+/* ------------------ TFJS Load ------------------ */
+let tfReady = false;
 let model = null;
-let modelStatus = "未読込";
+let modelInfo = "";
+let backendName = "cpu";
 
-const NUM_PTYPE = 14, NUM_SQ = 81;
-const HAND_ORDER = ['FU','KY','KE','GI','KI','KA','HI'];
-const D = 1 + (2 * NUM_PTYPE * NUM_SQ) + (2 * HAND_ORDER.length);
+async function initTf(modelUrl, backend) {
+  try {
+    // TFJS core
+    importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js");
 
-const VALUE = {FU:100,KY:300,KE:300,GI:400,KI:500,KA:700,HI:800,OU:0,TO:500,NY:500,NK:500,NG:500,UM:900,RY:1000};
+    // backend
+    if (backend === "wasm") {
+      importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js");
+      // wasm binaries path
+      if (tf?.wasm?.setWasmPaths) {
+        tf.wasm.setWasmPaths("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/");
+      }
+      await tf.setBackend("wasm");
+      await tf.ready();
+      backendName = "wasm";
+    } else {
+      await tf.setBackend("cpu");
+      await tf.ready();
+      backendName = "cpu";
+    }
 
-const PROM_MAP = {FU:"TO", KY:"NY", KE:"NK", GI:"NG", KA:"UM", HI:"RY"};
-const UNPROM_MAP = {TO:"FU", NY:"KY", NK:"KE", NG:"GI", UM:"KA", RY:"HI"};
+    model = await tf.loadLayersModel(modelUrl);
 
-const PTYPE_ID = {
-  FU: 1, KY: 2, KE: 3, GI: 4, KI: 5, KA: 6, HI: 7,
-  OU: 8, TO: 9, NY: 10, NK: 11, NG: 12, UM: 13, RY: 14,
-};
-const ID_PTYPE = Object.fromEntries(Object.entries(PTYPE_ID).map(([k,v])=>[v,k]));
+    const inName = model?.inputs?.[0]?.name || "(unknown)";
+    const outName = model?.outputs?.[0]?.name || "(unknown)";
+    const inShape = model?.inputs?.[0]?.shape ? JSON.stringify(model.inputs[0].shape) : "(unknown)";
+    modelInfo =
+      `model: ${modelUrl}\n` +
+      `backend: ${backendName}\n` +
+      `input: ${inName} shape=${inShape}\n` +
+      `output: ${outName}\n`;
 
-// --- v9: PVS/LMR tuning ---
-const PVS_WINDOW = 1.0;     // null-window幅（スコア単位）
-const LMR_MIN_DEPTH = 3;    // この深さ以上でLMRを使う
-const LMR_MOVE_NUM = 4;     // 4手目以降をLMR対象（序盤の数手は大事）
-const LMR_REDUCTION = 1;    // 1だけ浅く読む
-
-function sqIndex(x, y) { return y*9 + x; }
-function xyFromSq(sq){ return {x: sq % 9, y: (sq/9)|0}; }
-
-let inputKey = "input_layer_5";
-let outputName = "Identity:0";
-let expectedD = 2283;
-
-let cancelRequestId = -1;
-
-/* ===================== UI best string ===================== */
-function moveToBestStr(mv){
-  const pad2 = (n)=>String(n).padStart(2,"0");
-  if (!mv) return "-";
-  if (mv.fromSq === -1){
-    const t = typeNameFromAbsId(mv.dropAbsId);
-    return `${t}@${pad2(mv.toSq)}`;
+    tfReady = true;
+    return { ok: true };
+  } catch (e) {
+    tfReady = false;
+    model = null;
+    return { ok: false, error: String(e?.message || e) };
   }
-  return `${pad2(mv.fromSq)}${pad2(mv.toSq)}${mv.promote ? "+" : ""}`;
 }
 
-/* ===================== Zobrist + TT ===================== */
-const MASK64 = (1n<<64n) - 1n;
+/* ------------------ Shogi internal representation ------------------ */
+/*
+  boardA[sq] : Int16
+    0 = empty
+    +ptype (1..14) = S piece
+    -ptype (1..14) = G piece
 
-// TT: 2^20 = 1,048,576 entries
-const TT_POW = 20;
-const TT_SIZE = 1 << TT_POW;
-const TT_MASK = (1n << BigInt(TT_POW)) - 1n;
+  sideSign : +1 (S to move) / -1 (G to move)
 
-const TT_key = new BigUint64Array(TT_SIZE);
-const TT_val = new Float64Array(TT_SIZE);
-const TT_dep = new Int16Array(TT_SIZE);
-const TT_flg = new Int8Array(TT_SIZE);
-const TT_mov = new Int32Array(TT_SIZE);
+  piece types (match python-shogi piece_type 1..14 order):
+    1 FU, 2 KY, 3 KE, 4 GI, 5 KI, 6 KA, 7 HI, 8 OU,
+    9 TO, 10 NY, 11 NK, 12 NG, 13 UM, 14 RY
+*/
+const PTYPE = {
+  FU: 1, KY: 2, KE: 3, GI: 4, KI: 5, KA: 6, HI: 7, OU: 8,
+  TO: 9, NY: 10, NK: 11, NG: 12, UM: 13, RY: 14,
+};
+const PNAME = {
+  1:"FU",2:"KY",3:"KE",4:"GI",5:"KI",6:"KA",7:"HI",8:"OU",
+  9:"TO",10:"NY",11:"NK",12:"NG",13:"UM",14:"RY"
+};
 
-const TT_EXACT = 0, TT_LOWER = 1, TT_UPPER = 2;
+const HAND_ORDER = [PTYPE.FU, PTYPE.KY, PTYPE.KE, PTYPE.GI, PTYPE.KI, PTYPE.KA, PTYPE.HI]; // 7
+const HAND_IDX = new Map([[1,0],[2,1],[3,2],[4,3],[5,4],[6,5],[7,6]]);
 
-// NN評価キャッシュ（EvalTT）: 2^19 = 524,288 entries
-const ETT_POW = 19;
-const ETT_SIZE = 1 << ETT_POW;
-const ETT_MASK = (1n << BigInt(ETT_POW)) - 1n;
-const ETT_key = new BigUint64Array(ETT_SIZE);   // key = (hash ^ 1n)
-const ETT_val = new Float32Array(ETT_SIZE);     // value = eval score (side-to-move perspective)
-function evalProbe(hash){
-  const i = Number(hash & ETT_MASK);
-  const k = ETT_key[i];
-  const hk = (hash ^ 1n);
-  if (k === hk) return ETT_val[i];
-  return null;
+const PROM = new Int8Array(15);
+PROM[PTYPE.FU] = PTYPE.TO;
+PROM[PTYPE.KY] = PTYPE.NY;
+PROM[PTYPE.KE] = PTYPE.NK;
+PROM[PTYPE.GI] = PTYPE.NG;
+PROM[PTYPE.KA] = PTYPE.UM;
+PROM[PTYPE.HI] = PTYPE.RY;
+
+const UNPROM = new Int8Array(15);
+UNPROM[PTYPE.TO] = PTYPE.FU;
+UNPROM[PTYPE.NY] = PTYPE.KY;
+UNPROM[PTYPE.NK] = PTYPE.KE;
+UNPROM[PTYPE.NG] = PTYPE.GI;
+UNPROM[PTYPE.UM] = PTYPE.KA;
+UNPROM[PTYPE.RY] = PTYPE.HI;
+
+function baseTypeOf(pt) {
+  return UNPROM[pt] ? UNPROM[pt] : pt;
 }
-function evalStore(hash, v){
-  const i = Number(hash & ETT_MASK);
-  ETT_key[i] = (hash ^ 1n);
-  ETT_val[i] = v;
+function sideIdxFromSign(sign){ return sign === 1 ? 0 : 1; }
+function oppSign(sign){ return -sign; }
+function sqX(sq){ return sq % 9; }
+function sqY(sq){ return (sq / 9) | 0; }
+function sqIndex(x,y){ return y*9 + x; }
+function inside(x,y){ return x>=0 && x<9 && y>=0 && y<9; }
+
+function inPromoZone(sign, y){
+  // S: y<=2, G: y>=6
+  return (sign === 1) ? (y <= 2) : (y >= 6);
+}
+function mustPromote(pt, sign, toY){
+  if (pt === PTYPE.FU || pt === PTYPE.KY) {
+    return (sign===1) ? (toY===0) : (toY===8);
+  }
+  if (pt === PTYPE.KE) {
+    return (sign===1) ? (toY<=1) : (toY>=7);
+  }
+  return false;
+}
+function canPromote(pt){
+  return PROM[pt] !== 0;
 }
 
-const pieceZ = new BigUint64Array(2 * 15 * 81);
-const handZ  = new BigUint64Array(2 * 7 * 19);
-let sideZ = 0n;
+/* ------------------ Values (ordering / fallback) ------------------ */
+const VALUE = new Int32Array(15);
+VALUE[PTYPE.FU]=100; VALUE[PTYPE.KY]=300; VALUE[PTYPE.KE]=300; VALUE[PTYPE.GI]=400; VALUE[PTYPE.KI]=500;
+VALUE[PTYPE.KA]=700; VALUE[PTYPE.HI]=800; VALUE[PTYPE.OU]=0;
+VALUE[PTYPE.TO]=500; VALUE[PTYPE.NY]=500; VALUE[PTYPE.NK]=500; VALUE[PTYPE.NG]=500;
+VALUE[PTYPE.UM]=900; VALUE[PTYPE.RY]=1000;
 
-let rngState = 0x123456789abcdef0n;
-function rand64(){
-  rngState = (rngState * 6364136223846793005n + 1442695040888963407n) & MASK64;
-  return rngState;
+/* ------------------ Zobrist (for TT / eval cache) ------------------ */
+let Z_PIECE = null; // [2][15][81] BigInt
+let Z_HAND  = null; // [2][7][20] BigInt (count 0..19)
+let Z_SIDE  = 0n;
+
+function splitmix64(seed) {
+  // returns [nextSeed, rand64BigInt]
+  let x = BigInt.asUintN(64, seed + 0x9E3779B97F4A7C15n);
+  seed = x;
+  x = BigInt.asUintN(64, (x ^ (x >> 30n)) * 0xBF58476D1CE4E5B9n);
+  x = BigInt.asUintN(64, (x ^ (x >> 27n)) * 0x94D049BB133111EBn);
+  x = BigInt.asUintN(64, x ^ (x >> 31n));
+  return [seed, x];
 }
-function initZobrist(){
-  for (let i=0;i<pieceZ.length;i++) pieceZ[i] = rand64();
-  for (let i=0;i<handZ.length;i++)  handZ[i]  = rand64();
-  sideZ = rand64();
+function initZobrist() {
+  let seed = 0x123456789ABCDEFn;
+
+  Z_PIECE = Array.from({length:2}, () =>
+    Array.from({length:15}, () => Array.from({length:81}, () => 0n))
+  );
+  Z_HAND = Array.from({length:2}, () =>
+    Array.from({length:7}, () => Array.from({length:20}, () => 0n))
+  );
+
+  for (let s=0;s<2;s++){
+    for (let pt=1;pt<=14;pt++){
+      for (let sq=0;sq<81;sq++){
+        [seed, Z_PIECE[s][pt][sq]] = splitmix64(seed);
+      }
+    }
+  }
+  for (let s=0;s<2;s++){
+    for (let i=0;i<7;i++){
+      for (let c=0;c<20;c++){
+        [seed, Z_HAND[s][i][c]] = splitmix64(seed);
+      }
+    }
+  }
+  [seed, Z_SIDE] = splitmix64(seed);
 }
 initZobrist();
 
-function pz(color, absId, sq){
-  return pieceZ[((color*15 + absId) * 81) + sq];
-}
-function hz(color, handIndex, count){
-  return handZ[((color*7 + handIndex) * 19) + count];
-}
+/* ------------------ State (in worker) ------------------ */
+let boardA = new Int16Array(81);
+let handsA = [new Int16Array(7), new Int16Array(7)]; // [S][7], [G][7]
+let sideSign = 1; // +1 S, -1 G
+let hashKey = 0n;
 
-function packMove(mv){
-  const to = mv.toSq & 127;
-  const from = (mv.fromSq === -1 ? 127 : (mv.fromSq & 127));
-  const prom = mv.promote ? 1 : 0;
-  const drop = (mv.dropAbsId || 0) & 15;
-  return (to) | (from<<7) | (prom<<14) | (drop<<15);
-}
-function unpackMove(packed){
-  if (packed < 0) return null;
-  const toSq = packed & 127;
-  const from = (packed>>7) & 127;
-  const promote = ((packed>>14)&1) === 1;
-  const dropAbsId = (packed>>15) & 15;
-  const fromSq = (from===127) ? -1 : from;
-  return {fromSq, toSq, promote, dropAbsId: dropAbsId || 0};
-}
+// undo stack
+const undoStack = [];
 
-function ttIndex(hash){ return Number(hash & TT_MASK); }
-
-function ttProbe(hash, depth, alpha, beta){
-  const i = ttIndex(hash);
-  const k = TT_key[i];
-  if (k !== hash) return {hit:false, best:null, alpha, beta};
-  const d = TT_dep[i];
-  const best = unpackMove(TT_mov[i]);
-  if (d >= depth) {
-    const v = TT_val[i];
-    const f = TT_flg[i];
-    if (f === TT_EXACT) return {hit:true, value:v, cut:true, best, alpha, beta};
-    if (f === TT_LOWER) {
-      if (v > alpha) alpha = v;
-      if (alpha >= beta) return {hit:true, value:v, cut:true, best, alpha, beta};
-    } else if (f === TT_UPPER) {
-      if (v < beta) beta = v;
-      if (alpha >= beta) return {hit:true, value:v, cut:true, best, alpha, beta};
-    }
-  }
-  return {hit:true, cut:false, best, alpha, beta};
-}
-
-function ttStore(hash, depth, value, flag, bestMove){
-  const i = ttIndex(hash);
-  if (TT_key[i] !== hash || TT_dep[i] <= depth) {
-    TT_key[i] = hash;
-    TT_dep[i] = depth;
-    TT_val[i] = value;
-    TT_flg[i] = flag;
-    TT_mov[i] = bestMove ? packMove(bestMove) : -1;
-  }
-}
-
-/* ===================== Killer / History ===================== */
-const MAX_PLY = 64;
-const killer1 = new Int32Array(MAX_PLY); killer1.fill(-1);
-const killer2 = new Int32Array(MAX_PLY); killer2.fill(-1);
-const hist = new Int32Array(82 * 81);
-
-function isQuietMove(state, mv){
-  if (mv.fromSq === -1) return true;
-  const cap = state.board81[mv.toSq];
-  return cap === 0;
-}
-function histIndex(fromSq, toSq){
-  const fromIdx = (fromSq === -1) ? 81 : fromSq;
-  return fromIdx * 81 + toSq;
-}
-function recordKillerAndHistory(ply, mv, depth){
-  const pm = packMove(mv);
-  if (killer1[ply] !== pm) { killer2[ply] = killer1[ply]; killer1[ply] = pm; }
-  const idx = histIndex(mv.fromSq, mv.toSq);
-  hist[idx] += depth * depth;
-  if (hist[idx] > 2000000000) hist[idx] = 1000000000;
-}
-
-/* ===================== TFJS ===================== */
-function encodeForNN(board81, handsS, handsG, sideToMove /*0=S,1=G*/){
-  const x = new Float32Array(D);
-  x[0] = (sideToMove === 0) ? 1.0 : 0.0;
-
-  const base = 1;
-  for (let sq=0; sq<81; sq++){
-    const pc = board81[sq];
-    if (!pc) continue;
-    const color = (pc > 0) ? 0 : 1;
-    const pt = Math.abs(pc);
-    const pidx = pt - 1;
-    const idx = base + ((color * NUM_PTYPE + pidx) * NUM_SQ + sq);
-    x[idx] = 1.0;
-  }
-
-  const base2 = 1 + (2 * NUM_PTYPE * NUM_SQ);
-  for (let i=0;i<HAND_ORDER.length;i++) x[base2+i] = handsS[i] || 0;
-  for (let i=0;i<HAND_ORDER.length;i++) x[base2+HAND_ORDER.length+i] = handsG[i] || 0;
-  return x;
-}
-
-function predictSenteValue(feats2283){
-  if (!model || !tf) return null;
-  let v = null;
-  tf.tidy(() => {
-    const input = tf.tensor(feats2283, [1, D], "float32");
-    const dict = { [inputKey]: input };
-    const out = outputName ? model.execute(dict, outputName) : model.execute(dict);
-    const y = Array.isArray(out) ? out[0] : out;
-    v = y.dataSync()[0];
-  });
-  return v;
-}
-
-/* ===================== Internal ===================== */
-function opp(side){ return side ^ 1; }
-function typeNameFromAbsId(absId){ return ID_PTYPE[absId] || "FU"; }
-function absIdFromTypeName(name){ return PTYPE_ID[name] || 1; }
-function handIndexOfTypeName(t){ return HAND_ORDER.indexOf(t); }
-function unpromoteTypeName(tName){ return UNPROM_MAP[tName] || tName; }
-function promoteTypeName(tName){ return PROM_MAP[tName] || tName; }
-function inPromoZone(side, y){ return side===0 ? (y<=2) : (y>=6); }
-function canPromote(tName){ return !!PROM_MAP[tName]; }
-function mustPromote(tName, side, toY){
-  if (tName === 'FU' || tName === 'KY') return side===0 ? (toY===0) : (toY===8);
-  if (tName === 'KE') return side===0 ? (toY<=1) : (toY>=7);
-  return false;
-}
-function isOwnPiece(pc, side){ return side===0 ? (pc>0) : (pc<0); }
-
-function computeHash(board81, handsS, handsG, side){
+/* build hash from scratch */
+function computeHash() {
   let h = 0n;
   for (let sq=0;sq<81;sq++){
-    const pc = board81[sq];
-    if (!pc) continue;
-    const color = pc>0 ? 0 : 1;
-    const absId = Math.abs(pc);
-    h ^= pz(color, absId, sq);
-  }
-  for (let i=0;i<7;i++){
-    h ^= hz(0, i, handsS[i]||0);
-    h ^= hz(1, i, handsG[i]||0);
-  }
-  if (side===1) h ^= sideZ;
-  return h & MASK64;
-}
-
-/* ===================== Convert UI pos ===================== */
-function convertPos(pos){
-  const board81 = new Int16Array(81);
-  let kingSqS = -1, kingSqG = -1;
-
-  for (let y=0;y<9;y++) for (let x=0;x<9;x++){
-    const p = pos.board[y][x];
+    const p = boardA[sq];
     if (!p) continue;
-    const absId = absIdFromTypeName(p.type);
-    const sq = sqIndex(x,y);
-    const pc = (p.side === 'S') ? absId : -absId;
-    board81[sq] = pc;
-    if (absId === PTYPE_ID.OU){
-      if (p.side === 'S') kingSqS = sq;
-      else kingSqG = sq;
+    const s = p > 0 ? 0 : 1;
+    const pt = Math.abs(p);
+    h ^= Z_PIECE[s][pt][sq];
+  }
+  for (let s=0;s<2;s++){
+    for (let i=0;i<7;i++){
+      const c = handsA[s][i];
+      const cc = Math.max(0, Math.min(19, c));
+      h ^= Z_HAND[s][i][cc];
     }
   }
-
-  const handsS = new Int16Array(7);
-  const handsG = new Int16Array(7);
-  for (let i=0;i<7;i++){
-    const t = HAND_ORDER[i];
-    handsS[i] = (pos.hands.S[t] || 0);
-    handsG[i] = (pos.hands.G[t] || 0);
-  }
-
-  const side = (pos.sideToMove === 'S') ? 0 : 1;
-  const hash = computeHash(board81, handsS, handsG, side);
-
-  return { board81, handsS, handsG, side, kingSqS, kingSqG, hash };
+  if (sideSign === -1) h ^= Z_SIDE; // side bit
+  return h;
 }
 
-/* ===================== Move gen ===================== */
-function hasUnpromotedPawnOnFile(board81, side, fileX){
-  const pawnId = PTYPE_ID.FU;
-  for (let y=0;y<9;y++){
-    const sq = sqIndex(fileX,y);
-    const pc = board81[sq];
-    if (!pc) continue;
-    if (side===0){ if (pc === pawnId) return true; }
-    else { if (pc === -pawnId) return true; }
+/* ------------------ Move encoding ------------------ */
+/*
+  move object:
+    {fromSq, toSq, dropPt(0|1..7), promote(0|1), movedPt, capturedPiece, givesCheck, key}
+*/
+function moveKey(mv){
+  if (mv.dropPt) {
+    // 0x80000000 | (dropPt<<16) | to
+    return (0x80000000 | (mv.dropPt << 16) | (mv.toSq & 0xFF)) >>> 0;
   }
-  return false;
+  // (from<<16) | to | (promote<<30)
+  return (((mv.fromSq & 0xFF) << 16) | (mv.toSq & 0xFF) | ((mv.promote?1:0) << 30)) >>> 0;
+}
+function sameMoveKey(aKey, bKey){ return aKey === bKey; }
+
+function mvToBestStr(mv){
+  const pad2 = (n)=> String(n).padStart(2,"0");
+  if (mv.dropPt){
+    return `D${PNAME[mv.dropPt] || mv.dropPt}${pad2(mv.toSq)}`;
+  }
+  return `${pad2(mv.fromSq)}${pad2(mv.toSq)}${mv.promote?"+":""}`;
 }
 
-function genPseudoMoves(state){
-  const {board81, side, handsS, handsG} = state;
-  const moves = [];
-  const forward = (side===0) ? -1 : 1;
-
-  function pushMove(fromSq, toSq, promote){ moves.push({fromSq, toSq, promote: !!promote}); }
-  function pushMoveWithPromo(fromSq, toSq, tName, fromY, toY){
-    if (!canPromote(tName)) { pushMove(fromSq,toSq,false); return; }
-    const promoPossible = inPromoZone(side, fromY) || inPromoZone(side, toY);
-    const forced = mustPromote(tName, side, toY);
-    if (!promoPossible) { pushMove(fromSq,toSq,false); return; }
-    if (forced) { pushMove(fromSq,toSq,true); return; }
-    pushMove(fromSq,toSq,false);
-    pushMove(fromSq,toSq,true);
+function mvToUI(mv){
+  const to = { x: sqX(mv.toSq), y: sqY(mv.toSq) };
+  if (mv.dropPt){
+    return { from: null, to, drop: (PNAME[mv.dropPt] || "FU"), promote: false };
   }
-
-  for (let sq=0;sq<81;sq++){
-    const pc = board81[sq];
-    if (!pc) continue;
-    if (!isOwnPiece(pc, side)) continue;
-
-    const absId = Math.abs(pc);
-    const tName = typeNameFromAbsId(absId);
-    const {x,y} = xyFromSq(sq);
-
-    const addStep = (dx,dy)=>{
-      const nx=x+dx, ny=y+dy;
-      if (nx<0||nx>=9||ny<0||ny>=9) return;
-      const toSq = sqIndex(nx,ny);
-      const tp = board81[toSq];
-      if (tp && isOwnPiece(tp, side)) return;
-      pushMoveWithPromo(sq, toSq, tName, y, ny);
-    };
-    const addSlide = (dx,dy)=>{
-      for (let k=1;k<9;k++){
-        const nx=x+dx*k, ny=y+dy*k;
-        if (nx<0||nx>=9||ny<0||ny>=9) break;
-        const toSq=sqIndex(nx,ny);
-        const tp=board81[toSq];
-        if (tp && isOwnPiece(tp, side)) break;
-        pushMoveWithPromo(sq,toSq,tName,y,ny);
-        if (tp) break;
-      }
-    };
-
-    switch(tName){
-      case 'FU': addStep(0, forward); break;
-      case 'KY': addSlide(0, forward); break;
-      case 'KE': addStep(-1, 2*forward); addStep(1, 2*forward); break;
-      case 'GI':
-        addStep(-1, forward); addStep(0, forward); addStep(1, forward);
-        addStep(-1, -forward); addStep(1, -forward);
-        break;
-      case 'KI':
-      case 'TO': case 'NY': case 'NK': case 'NG':
-        addStep(-1, forward); addStep(0, forward); addStep(1, forward);
-        addStep(-1, 0); addStep(1, 0);
-        addStep(0, -forward);
-        break;
-      case 'KA': addSlide(1,1); addSlide(1,-1); addSlide(-1,1); addSlide(-1,-1); break;
-      case 'HI': addSlide(1,0); addSlide(-1,0); addSlide(0,1); addSlide(0,-1); break;
-      case 'OU':
-        for (const dx of [-1,0,1]) for (const dy of [-1,0,1]) if(dx||dy) addStep(dx,dy);
-        break;
-      case 'UM':
-        addSlide(1,1); addSlide(1,-1); addSlide(-1,1); addSlide(-1,-1);
-        addStep(1,0); addStep(-1,0); addStep(0,1); addStep(0,-1);
-        break;
-      case 'RY':
-        addSlide(1,0); addSlide(-1,0); addSlide(0,1); addSlide(0,-1);
-        addStep(1,1); addStep(1,-1); addStep(-1,1); addStep(-1,-1);
-        break;
-    }
-  }
-
-  const hands = (side===0) ? handsS : handsG;
-  for (let i=0;i<7;i++){
-    const n = hands[i];
-    if (n<=0) continue;
-    const tName = HAND_ORDER[i];
-
-    for (let y=0;y<9;y++) for (let x=0;x<9;x++){
-      const toSq = sqIndex(x,y);
-      if (board81[toSq]) continue;
-
-      if (tName==='FU' || tName==='KY'){
-        if ((side===0 && y===0) || (side===1 && y===8)) continue;
-      }
-      if (tName==='KE'){
-        if ((side===0 && y<=1) || (side===1 && y>=7)) continue;
-      }
-      if (tName==='FU'){
-        if (hasUnpromotedPawnOnFile(board81, side, x)) continue;
-      }
-      moves.push({fromSq:-1, toSq, dropAbsId: absIdFromTypeName(tName), promote:false});
-    }
-  }
-
-  return moves;
+  const from = { x: sqX(mv.fromSq), y: sqY(mv.fromSq) };
+  return { from, to, drop: null, promote: !!mv.promote };
 }
 
-function genPseudoCaptures(state){
-  const {board81, side} = state;
-  const moves = [];
-  const forward = (side===0) ? -1 : 1;
+/* ------------------ Make / Unmake (in-place) ------------------ */
+function xorHandCount(sign, handIdx, oldC, newC){
+  const s = sideIdxFromSign(sign);
+  const o = Math.max(0, Math.min(19, oldC));
+  const n = Math.max(0, Math.min(19, newC));
+  hashKey ^= Z_HAND[s][handIdx][o];
+  hashKey ^= Z_HAND[s][handIdx][n];
+}
 
-  function pushMove(fromSq, toSq, promote){ moves.push({fromSq, toSq, promote: !!promote}); }
-  function pushMoveWithPromo(fromSq, toSq, tName, fromY, toY){
-    if (!canPromote(tName)) { pushMove(fromSq,toSq,false); return; }
-    const promoPossible = inPromoZone(side, fromY) || inPromoZone(side, toY);
-    const forced = mustPromote(tName, side, toY);
-    if (!promoPossible) { pushMove(fromSq,toSq,false); return; }
-    if (forced) { pushMove(fromSq,toSq,true); return; }
-    pushMove(fromSq,toSq,false);
-    pushMove(fromSq,toSq,true);
-  }
-
-  const foeSign = (side===0) ? -1 : +1;
-  const isFoeAt = (sq)=>{
-    const pc = board81[sq];
-    return pc && ((pc>0?+1:-1) === foeSign);
+function makeMove(mv){
+  // store undo
+  const u = {
+    fromSq: mv.fromSq,
+    toSq: mv.toSq,
+    dropPt: mv.dropPt,
+    promote: mv.promote,
+    movedPiece: 0,
+    capturedPiece: 0,
+    addedHandIdx: -1, // if capture adds to hand
+    prevSide: sideSign,
+    prevHash: hashKey,
   };
 
-  for (let sq=0;sq<81;sq++){
-    const pc = board81[sq];
-    if (!pc) continue;
-    if (!isOwnPiece(pc, side)) continue;
+  const sIdx = sideIdxFromSign(sideSign);
 
-    const absId = Math.abs(pc);
-    const tName = typeNameFromAbsId(absId);
-    const {x,y} = xyFromSq(sq);
+  if (mv.dropPt){
+    // drop from hand
+    const hidx = HAND_IDX.get(mv.dropPt);
+    const oldC = handsA[sIdx][hidx];
+    const newC = oldC - 1;
+    handsA[sIdx][hidx] = newC;
+    xorHandCount(sideSign, hidx, oldC, newC);
 
-    const addStepCap = (dx,dy)=>{
-      const nx=x+dx, ny=y+dy;
-      if (nx<0||nx>=9||ny<0||ny>=9) return;
-      const toSq = sqIndex(nx,ny);
-      if (!isFoeAt(toSq)) return;
-      pushMoveWithPromo(sq, toSq, tName, y, ny);
-    };
-    const addSlideCap = (dx,dy)=>{
-      for (let k=1;k<9;k++){
-        const nx=x+dx*k, ny=y+dy*k;
-        if (nx<0||nx>=9||ny<0||ny>=9) break;
-        const toSq=sqIndex(nx,ny);
-        const tp=board81[toSq];
-        if (!tp) continue;
-        if (isOwnPiece(tp, side)) break;
-        pushMoveWithPromo(sq,toSq,tName,y,ny);
-        break;
-      }
-    };
+    // place on board
+    const toSq = mv.toSq;
+    // empty assumed
+    boardA[toSq] = sideSign * mv.dropPt;
+    hashKey ^= Z_PIECE[sIdx][mv.dropPt][toSq];
 
-    switch(tName){
-      case 'FU': addStepCap(0, forward); break;
-      case 'KY': addSlideCap(0, forward); break;
-      case 'KE': addStepCap(-1, 2*forward); addStepCap(1, 2*forward); break;
-      case 'GI':
-        addStepCap(-1, forward); addStepCap(0, forward); addStepCap(1, forward);
-        addStepCap(-1, -forward); addStepCap(1, -forward);
-        break;
-      case 'KI':
-      case 'TO': case 'NY': case 'NK': case 'NG':
-        addStepCap(-1, forward); addStepCap(0, forward); addStepCap(1, forward);
-        addStepCap(-1, 0); addStepCap(1, 0);
-        addStepCap(0, -forward);
-        break;
-      case 'KA': addSlideCap(1,1); addSlideCap(1,-1); addSlideCap(-1,1); addSlideCap(-1,-1); break;
-      case 'HI': addSlideCap(1,0); addSlideCap(-1,0); addSlideCap(0,1); addSlideCap(0,-1); break;
-      case 'OU':
-        for (const dx of [-1,0,1]) for (const dy of [-1,0,1]) if(dx||dy) addStepCap(dx,dy);
-        break;
-      case 'UM':
-        addSlideCap(1,1); addSlideCap(1,-1); addSlideCap(-1,1); addSlideCap(-1,-1);
-        addStepCap(1,0); addStepCap(-1,0); addStepCap(0,1); addStepCap(0,-1);
-        break;
-      case 'RY':
-        addSlideCap(1,0); addSlideCap(-1,0); addSlideCap(0,1); addSlideCap(0,-1);
-        addStepCap(1,1); addStepCap(1,-1); addStepCap(-1,1); addStepCap(-1,-1);
-        break;
+    // flip side
+    sideSign = -sideSign;
+    hashKey ^= Z_SIDE;
+
+    undoStack.push(u);
+    return;
+  }
+
+  const fromSq = mv.fromSq;
+  const toSq = mv.toSq;
+  const moved = boardA[fromSq];
+  const cap = boardA[toSq];
+
+  u.movedPiece = moved;
+  u.capturedPiece = cap;
+
+  // remove moved from fromSq
+  {
+    const pt = Math.abs(moved);
+    const s = moved > 0 ? 0 : 1;
+    hashKey ^= Z_PIECE[s][pt][fromSq];
+  }
+  boardA[fromSq] = 0;
+
+  // capture
+  if (cap){
+    const capPt = Math.abs(cap);
+    const capSide = cap > 0 ? 0 : 1;
+    hashKey ^= Z_PIECE[capSide][capPt][toSq];
+
+    const base = baseTypeOf(capPt);
+    if (base !== PTYPE.OU) {
+      const hidx = HAND_IDX.get(base);
+      const oldC = handsA[sIdx][hidx];
+      const newC = oldC + 1;
+      handsA[sIdx][hidx] = newC;
+      xorHandCount(sideSign, hidx, oldC, newC);
+      u.addedHandIdx = hidx;
     }
   }
 
-  return moves;
+  // place moved to toSq (maybe promoted)
+  let newPt = Math.abs(moved);
+  if (mv.promote){
+    const p = PROM[newPt];
+    if (p) newPt = p;
+  }
+  boardA[toSq] = sideSign * newPt;
+  hashKey ^= Z_PIECE[sIdx][newPt][toSq];
+
+  // flip side
+  sideSign = -sideSign;
+  hashKey ^= Z_SIDE;
+
+  undoStack.push(u);
 }
 
-/* ===================== Check detection ===================== */
-function attacksSquare(board81, fromSq, pc, tx, ty){
-  const side = (pc>0) ? 0 : 1;
-  const absId = Math.abs(pc);
-  const tName = typeNameFromAbsId(absId);
-  const {x,y} = xyFromSq(fromSq);
-  const forward = (side===0) ? -1 : 1;
+function unmakeMove(){
+  const u = undoStack.pop();
+  if (!u) return;
 
-  const step = (dx,dy)=> (x+dx===tx && y+dy===ty);
-  const slide = (dx,dy)=>{
+  // restore whole hash fast
+  sideSign = u.prevSide;
+  hashKey = u.prevHash;
+
+  if (u.dropPt){
+    // remove dropped piece from board
+    boardA[u.toSq] = 0;
+
+    // restore hand count (+1 back)
+    const sIdx = sideIdxFromSign(sideSign);
+    const hidx = HAND_IDX.get(u.dropPt);
+    handsA[sIdx][hidx] += 1;
+    return;
+  }
+
+  // restore pieces
+  boardA[u.fromSq] = u.movedPiece;
+  boardA[u.toSq] = u.capturedPiece;
+
+  // restore hands if capture happened
+  if (u.capturedPiece && u.addedHandIdx >= 0){
+    const sIdx = sideIdxFromSign(sideSign);
+    handsA[sIdx][u.addedHandIdx] -= 1;
+  }
+}
+
+/* ------------------ Check / Attacks ------------------ */
+function findKingSq(sign){
+  const king = sign * PTYPE.OU;
+  for (let sq=0;sq<81;sq++){
+    if (boardA[sq] === king) return sq;
+  }
+  return -1;
+}
+
+function attacksSquare(fromSq, pAbs, pSign, targetSq){
+  const fx = sqX(fromSq), fy = sqY(fromSq);
+  const tx = sqX(targetSq), ty = sqY(targetSq);
+
+  const dir = (pSign === 1) ? -1 : 1; // forward y
+
+  const step = (dx,dy) => (fx+dx===tx && fy+dy===ty);
+  const slide = (dx,dy) => {
     for (let k=1;k<9;k++){
-      const nx=x+dx*k, ny=y+dy*k;
-      if (nx<0||nx>=9||ny<0||ny>=9) return false;
+      const nx=fx+dx*k, ny=fy+dy*k;
+      if (!inside(nx,ny)) return false;
       const sq = sqIndex(nx,ny);
-      if (nx===tx && ny===ty) return true;
-      if (board81[sq]) return false;
+      if (sq === targetSq) return true;
+      if (boardA[sq] !== 0) return false;
     }
     return false;
   };
 
-  switch(tName){
-    case 'FU': return step(0, forward);
-    case 'KY': return slide(0, forward);
-    case 'KE': return step(-1,2*forward) || step(1,2*forward);
-    case 'GI':
-      return step(-1,forward)||step(0,forward)||step(1,forward)||step(-1,-forward)||step(1,-forward);
-    case 'KI':
-    case 'TO': case 'NY': case 'NK': case 'NG':
-      return step(-1,forward)||step(0,forward)||step(1,forward)||step(-1,0)||step(1,0)||step(0,-forward);
-    case 'KA': return slide(1,1)||slide(1,-1)||slide(-1,1)||slide(-1,-1);
-    case 'HI': return slide(1,0)||slide(-1,0)||slide(0,1)||slide(0,-1);
-    case 'OU':
-      for (const dx of [-1,0,1]) for (const dy of [-1,0,1]) if(dx||dy) if(step(dx,dy)) return true;
+  switch (pAbs){
+    case PTYPE.FU: return step(0,dir);
+    case PTYPE.KY: return slide(0,dir);
+    case PTYPE.KE: return step(-1,2*dir) || step(1,2*dir);
+    case PTYPE.GI:
+      return step(-1,dir)||step(0,dir)||step(1,dir)||step(-1,-dir)||step(1,-dir);
+    case PTYPE.KI:
+    case PTYPE.TO: case PTYPE.NY: case PTYPE.NK: case PTYPE.NG:
+      return step(-1,dir)||step(0,dir)||step(1,dir)||step(-1,0)||step(1,0)||step(0,-dir);
+    case PTYPE.KA: return slide(1,1)||slide(1,-1)||slide(-1,1)||slide(-1,-1);
+    case PTYPE.HI: return slide(1,0)||slide(-1,0)||slide(0,1)||slide(0,-1);
+    case PTYPE.OU: {
+      for (const dx of [-1,0,1]) for (const dy of [-1,0,1]) {
+        if (!dx && !dy) continue;
+        if (step(dx,dy)) return true;
+      }
       return false;
-    case 'UM':
+    }
+    case PTYPE.UM:
       return (slide(1,1)||slide(1,-1)||slide(-1,1)||slide(-1,-1)) ||
              step(1,0)||step(-1,0)||step(0,1)||step(0,-1);
-    case 'RY':
+    case PTYPE.RY:
       return (slide(1,0)||slide(-1,0)||slide(0,1)||slide(0,-1)) ||
              step(1,1)||step(1,-1)||step(-1,1)||step(-1,-1);
   }
   return false;
 }
 
-function isKingInCheck(board81, side, kingSqS, kingSqG){
-  const ksq = (side===0) ? kingSqS : kingSqG;
+function isKingInCheck(sign){
+  const ksq = findKingSq(sign);
   if (ksq < 0) return false;
-  const {x:kx, y:ky} = xyFromSq(ksq);
-  const foeSide = opp(side);
+  const foe = -sign;
 
   for (let sq=0;sq<81;sq++){
-    const pc = board81[sq];
-    if (!pc) continue;
-    if (foeSide===0 && pc<=0) continue;
-    if (foeSide===1 && pc>=0) continue;
-    if (attacksSquare(board81, sq, pc, kx, ky)) return true;
+    const p = boardA[sq];
+    if (!p) continue;
+    if ((p > 0 ? 1 : -1) !== foe) continue;
+    if (attacksSquare(sq, Math.abs(p), foe, ksq)) return true;
   }
   return false;
 }
 
-/* ===================== make/unmake (hash update) ===================== */
-function makeMove(state, mv, stack){
-  const {board81} = state;
-  const side = state.side;
+/* ------------------ Move generation (legal) ------------------ */
+function hasUnpromotedPawnOnFile(sign, fileX){
+  const pawn = sign * PTYPE.FU;
+  for (let y=0;y<9;y++){
+    const sq = sqIndex(fileX,y);
+    if (boardA[sq] === pawn) return true;
+  }
+  return false;
+}
 
-  const rec = {
-    fromSq: mv.fromSq,
-    toSq: mv.toSq,
-    dropAbsId: mv.dropAbsId || 0,
-    promote: !!mv.promote,
-    capPc: board81[mv.toSq] || 0,
-    movedPc: 0,
-    prevSide: side,
-    prevKingS: state.kingSqS,
-    prevKingG: state.kingSqG,
-    prevHash: state.hash,
-    handIncType: 0,
+function pushMoveWithPromo(moves, fromSq, toSq, ptAbs, promotePossible, forced){
+  if (!promotePossible){
+    moves.push({fromSq, toSq, dropPt:0, promote:0, movedPt:ptAbs, capturedPiece:boardA[toSq], givesCheck:false, key:0});
+    return;
+  }
+  if (forced){
+    moves.push({fromSq, toSq, dropPt:0, promote:1, movedPt:ptAbs, capturedPiece:boardA[toSq], givesCheck:false, key:0});
+    return;
+  }
+  // both
+  moves.push({fromSq, toSq, dropPt:0, promote:0, movedPt:ptAbs, capturedPiece:boardA[toSq], givesCheck:false, key:0});
+  moves.push({fromSq, toSq, dropPt:0, promote:1, movedPt:ptAbs, capturedPiece:boardA[toSq], givesCheck:false, key:0});
+}
+
+function genPseudoMovesForPiece(moves, fromSq, pAbs, pSign){
+  const x = sqX(fromSq), y = sqY(fromSq);
+  const dir = (pSign === 1) ? -1 : 1;
+
+  const addStep = (dx,dy) => {
+    const nx = x+dx, ny = y+dy;
+    if (!inside(nx,ny)) return;
+    const toSq = sqIndex(nx,ny);
+    const tp = boardA[toSq];
+    if (tp && (tp > 0 ? 1 : -1) === pSign) return;
+
+    const promoPossible = canPromote(pAbs) && (inPromoZone(pSign, y) || inPromoZone(pSign, ny));
+    const forced = mustPromote(pAbs, pSign, ny);
+    pushMoveWithPromo(moves, fromSq, toSq, pAbs, promoPossible, forced);
   };
 
-  state.hash ^= sideZ;
+  const addSlide = (dx,dy) => {
+    for (let k=1;k<9;k++){
+      const nx=x+dx*k, ny=y+dy*k;
+      if (!inside(nx,ny)) break;
+      const toSq = sqIndex(nx,ny);
+      const tp = boardA[toSq];
+      if (tp && (tp > 0 ? 1 : -1) === pSign) break;
 
-  if (mv.fromSq === -1) {
-    const absId = mv.dropAbsId;
-    const pc = (side===0) ? absId : -absId;
+      const promoPossible = canPromote(pAbs) && (inPromoZone(pSign, y) || inPromoZone(pSign, ny));
+      const forced = mustPromote(pAbs, pSign, ny);
+      pushMoveWithPromo(moves, fromSq, toSq, pAbs, promoPossible, forced);
 
-    const hands = (side===0) ? state.handsS : state.handsG;
-    const tName = typeNameFromAbsId(absId);
-    const hi = handIndexOfTypeName(tName);
-    const oldC = hands[hi];
-    const newC = oldC - 1;
-    state.hash ^= hz(side, hi, oldC);
-    state.hash ^= hz(side, hi, newC);
-    hands[hi] = newC;
+      if (tp) break;
+    }
+  };
 
-    state.hash ^= pz(side, absId, mv.toSq);
-    board81[mv.toSq] = pc;
-    rec.movedPc = pc;
-  } else {
-    const fromPc = board81[mv.fromSq];
-    rec.movedPc = fromPc;
+  switch (pAbs){
+    case PTYPE.FU: addStep(0,dir); break;
+    case PTYPE.KY: addSlide(0,dir); break;
+    case PTYPE.KE: addStep(-1,2*dir); addStep(1,2*dir); break;
+    case PTYPE.GI:
+      addStep(-1,dir); addStep(0,dir); addStep(1,dir);
+      addStep(-1,-dir); addStep(1,-dir);
+      break;
+    case PTYPE.KI:
+    case PTYPE.TO: case PTYPE.NY: case PTYPE.NK: case PTYPE.NG:
+      addStep(-1,dir); addStep(0,dir); addStep(1,dir);
+      addStep(-1,0); addStep(1,0);
+      addStep(0,-dir);
+      break;
+    case PTYPE.KA: addSlide(1,1); addSlide(1,-1); addSlide(-1,1); addSlide(-1,-1); break;
+    case PTYPE.HI: addSlide(1,0); addSlide(-1,0); addSlide(0,1); addSlide(0,-1); break;
+    case PTYPE.OU:
+      for (const dx of [-1,0,1]) for (const dy of [-1,0,1]) if (dx||dy) addStep(dx,dy);
+      break;
+    case PTYPE.UM:
+      addSlide(1,1); addSlide(1,-1); addSlide(-1,1); addSlide(-1,-1);
+      addStep(1,0); addStep(-1,0); addStep(0,1); addStep(0,-1);
+      break;
+    case PTYPE.RY:
+      addSlide(1,0); addSlide(-1,0); addSlide(0,1); addSlide(0,-1);
+      addStep(1,1); addStep(1,-1); addStep(-1,1); addStep(-1,-1);
+      break;
+  }
+}
 
-    const fromAbs = Math.abs(fromPc);
-    state.hash ^= pz(side, fromAbs, mv.fromSq);
+function genDropMoves(moves, sign){
+  const sIdx = sideIdxFromSign(sign);
+  for (let i=0;i<7;i++){
+    const pt = HAND_ORDER[i];
+    if (handsA[sIdx][i] <= 0) continue;
 
-    if (rec.capPc) {
-      const capAbs = Math.abs(rec.capPc);
-      state.hash ^= pz(opp(side), capAbs, mv.toSq);
+    for (let sq=0;sq<81;sq++){
+      if (boardA[sq]) continue;
+      const x = sqX(sq), y = sqY(sq);
 
-      const capName = typeNameFromAbsId(capAbs);
-      const baseName = unpromoteTypeName(capName);
-      const baseAbs = absIdFromTypeName(baseName);
-      rec.handIncType = baseAbs;
+      // cannot drop on last ranks
+      if ((pt===PTYPE.FU || pt===PTYPE.KY) && ((sign===1 && y===0) || (sign===-1 && y===8))) continue;
+      if (pt===PTYPE.KE && ((sign===1 && y<=1) || (sign===-1 && y>=7))) continue;
 
-      if (baseAbs !== PTYPE_ID.OU) {
-        const hands = (side===0) ? state.handsS : state.handsG;
-        const hi = handIndexOfTypeName(baseName);
-        const oldC = hands[hi];
-        const newC = oldC + 1;
-        state.hash ^= hz(side, hi, oldC);
-        state.hash ^= hz(side, hi, newC);
-        hands[hi] = newC;
+      // nifu
+      if (pt===PTYPE.FU && hasUnpromotedPawnOnFile(sign, x)) continue;
+
+      moves.push({fromSq:-1, toSq:sq, dropPt:pt, promote:0, movedPt:pt, capturedPiece:0, givesCheck:false, key:0});
+    }
+  }
+}
+
+function hasAnyLegalMoveCurrentSide(){
+  const sign = sideSign;
+
+  // pseudo list, stop at first legal
+  const pseudo = [];
+  for (let sq=0;sq<81;sq++){
+    const p = boardA[sq];
+    if (!p) continue;
+    const ps = p > 0 ? 1 : -1;
+    if (ps !== sign) continue;
+    genPseudoMovesForPiece(pseudo, sq, Math.abs(p), ps);
+    if (pseudo.length > 128) break; // enough; still safe
+  }
+  genDropMoves(pseudo, sign);
+
+  for (let i=0;i<pseudo.length;i++){
+    const mv = pseudo[i];
+    makeMove(mv);
+    const ok = !isKingInCheck(-sideSign); // after makeMove, sideSign flipped. need original sign -> now -sideSign
+    if (ok){
+      unmakeMove();
+      return true;
+    }
+    unmakeMove();
+  }
+  return false;
+}
+
+function generateLegalMovesForCurrentSide() {
+  const sign = sideSign;
+  const pseudo = [];
+  for (let sq=0;sq<81;sq++){
+    const p = boardA[sq];
+    if (!p) continue;
+    const ps = p > 0 ? 1 : -1;
+    if (ps !== sign) continue;
+    genPseudoMovesForPiece(pseudo, sq, Math.abs(p), ps);
+  }
+  genDropMoves(pseudo, sign);
+
+  const legals = [];
+  for (let i=0;i<pseudo.length;i++){
+    const mv = pseudo[i];
+
+    makeMove(mv);
+    // after makeMove, sideSign flipped (opponent to move).
+    // legality: our king (original sign) must not be in check
+    const illegal = isKingInCheck(-sideSign); // original sign = -sideSign
+    if (illegal){
+      unmakeMove();
+      continue;
+    }
+
+    // givesCheck?
+    const gives = isKingInCheck(sideSign); // opponent king in check? (opponent sign = sideSign)
+    mv.givesCheck = gives;
+
+    // uchi-fuzume simple (pawn drop checkmate)
+    if (mv.dropPt === PTYPE.FU && gives){
+      // if opponent has no legal move => illegal
+      const any = hasAnyLegalMoveCurrentSide(); // current side is opponent now (sideSign)
+      if (!any){
+        unmakeMove();
+        continue;
       }
     }
 
-    board81[mv.fromSq] = 0;
+    unmakeMove();
 
-    let tName = typeNameFromAbsId(fromAbs);
-    if (mv.promote) tName = promoteTypeName(tName);
-    const toAbs = absIdFromTypeName(tName);
-    const toPc = (side===0) ? toAbs : -toAbs;
-
-    state.hash ^= pz(side, toAbs, mv.toSq);
-    board81[mv.toSq] = toPc;
-
-    if (toAbs === PTYPE_ID.OU) {
-      if (side===0) state.kingSqS = mv.toSq;
-      else state.kingSqG = mv.toSq;
-    }
+    mv.key = moveKey(mv);
+    legals.push(mv);
   }
-
-  state.hash &= MASK64;
-  state.side = opp(side);
-  stack.push(rec);
-  return rec;
+  return legals;
 }
 
-function unmakeMove(state, stack){
-  const rec = stack.pop();
-  if (!rec) return;
+/* ------------------ NN Encode (D=2283) ------------------ */
+const NUM_PTYPE = 14;
+const NUM_SQ = 81;
+const D = 1 + (2 * NUM_PTYPE * NUM_SQ) + (2 * 7); // 2283
 
-  state.side = rec.prevSide;
-  state.kingSqS = rec.prevKingS;
-  state.kingSqG = rec.prevKingG;
-  state.hash = rec.prevHash;
+function encodeToFloat32() {
+  const x = new Float32Array(D);
+  x[0] = (sideSign === 1) ? 1.0 : 0.0;
 
-  const {board81} = state;
-  const side = rec.prevSide;
-
-  if (rec.fromSq === -1) {
-    board81[rec.toSq] = 0;
-    const absId = rec.dropAbsId;
-    const tName = typeNameFromAbsId(absId);
-    const hi = handIndexOfTypeName(tName);
-    const hands = (side===0) ? state.handsS : state.handsG;
-    hands[hi] += 1;
-  } else {
-    board81[rec.fromSq] = rec.movedPc;
-    board81[rec.toSq] = rec.capPc;
-
-    if (rec.handIncType && rec.handIncType !== PTYPE_ID.OU) {
-      const baseName = typeNameFromAbsId(rec.handIncType);
-      const hi = handIndexOfTypeName(baseName);
-      const hands = (side===0) ? state.handsS : state.handsG;
-      hands[hi] -= 1;
-    }
-  }
-}
-
-/* ===================== Legal moves ===================== */
-function genLegalMoves(state){
-  const pseudo = genPseudoMoves(state);
-  const legal = [];
-  const stack = [];
-
-  for (const mv of pseudo){
-    makeMove(state, mv, stack);
-    const mover = opp(state.side);
-    const ok = !isKingInCheck(state.board81, mover, state.kingSqS, state.kingSqG);
-    if (ok) legal.push(mv);
-    unmakeMove(state, stack);
-  }
-  return legal;
-}
-
-function genLegalCaptures(state){
-  const pseudo = genPseudoCaptures(state);
-  const legal = [];
-  const stack = [];
-  for (const mv of pseudo){
-    makeMove(state, mv, stack);
-    const mover = opp(state.side);
-    const ok = !isKingInCheck(state.board81, mover, state.kingSqS, state.kingSqG);
-    if (ok) legal.push(mv);
-    unmakeMove(state, stack);
-  }
-  return legal;
-}
-
-/* ===================== eval ===================== */
-function materialEval(state){
-  let s=0;
-  const b=state.board81;
-
+  const base = 1;
   for (let sq=0;sq<81;sq++){
-    const pc=b[sq];
-    if (!pc) continue;
-    const absId=Math.abs(pc);
-    const tName=typeNameFromAbsId(absId);
-    const v = VALUE[tName] || 0;
-    s += (pc>0) ? v : -v;
+    const p = boardA[sq];
+    if (!p) continue;
+    const color = (p > 0) ? 0 : 1; // S=0, G=1
+    const pidx = Math.abs(p) - 1; // 0..13
+    const idx = base + (color * NUM_PTYPE + pidx) * NUM_SQ + sq;
+    x[idx] = 1.0;
+  }
+
+  const base2 = 1 + (2 * NUM_PTYPE * NUM_SQ);
+  // S hands then G hands
+  for (let i=0;i<7;i++){
+    x[base2 + i] = handsA[0][i];
+    x[base2 + 7 + i] = handsA[1][i];
+  }
+  return x;
+}
+
+/* ------------------ Eval (NN / fallback) + cache ------------------ */
+const evalCache = new Map(); // hashKey(BigInt) -> score (side-to-move perspective)
+const EVAL_CACHE_MAX = 50000;
+
+function materialFallbackScore(){
+  // score from side-to-move perspective
+  let s = 0;
+  for (let sq=0;sq<81;sq++){
+    const p = boardA[sq];
+    if (!p) continue;
+    const pt = Math.abs(p);
+    const v = VALUE[pt] || 0;
+    s += (p > 0) ? v : -v; // S view
   }
   for (let i=0;i<7;i++){
-    const t = HAND_ORDER[i];
-    const v = VALUE[t] || 0;
-    s += v * (state.handsS[i]||0);
-    s -= v * (state.handsG[i]||0);
+    s += handsA[0][i] * (VALUE[HAND_ORDER[i]]||0);
+    s -= handsA[1][i] * (VALUE[HAND_ORDER[i]]||0);
   }
-  return s;
+  // convert to side-to-move view
+  return (sideSign === 1) ? s : -s;
 }
 
-function evalForSearch(state, useNN){
-  if (!useNN || !model || !tf) {
-    const m = materialEval(state);
-    return (state.side===0) ? m : -m;
-  }
-
-  const cached = evalProbe(state.hash);
+function evalScore(useNN){
+  const key = hashKey;
+  const cached = evalCache.get(key);
   if (cached != null) return cached;
 
-  const feats = encodeForNN(state.board81, state.handsS, state.handsG, state.side);
-  const v = predictSenteValue(feats);
-
-  let score;
-  if (v == null || Number.isNaN(v)) {
-    const m = materialEval(state);
-    score = (state.side===0) ? m : -m;
+  let score = 0;
+  if (useNN && tfReady && model) {
+    try {
+      const feats = encodeToFloat32();
+      // model output is assumed to be "side-to-move" value in [-1,1]
+      let v = 0;
+      tf.tidy(() => {
+        const t = tf.tensor(feats, [1, D], "float32");
+        const out = model.predict(t);
+        v = out.dataSync()[0];
+      });
+      score = v * 10000.0;
+    } catch (e) {
+      score = materialFallbackScore();
+    }
   } else {
-    const senteScore = v * 10000.0;
-    score = (state.side===0) ? senteScore : -senteScore;
+    score = materialFallbackScore();
   }
 
-  evalStore(state.hash, score);
+  // cache bound
+  if (evalCache.size > EVAL_CACHE_MAX) evalCache.clear();
+  evalCache.set(key, score);
   return score;
 }
 
-/* ===================== time helpers ===================== */
-function timeOrCancel(deadline, requestId){
-  if (requestId === cancelRequestId) throw new Error("__CANCEL__");
-  if (Date.now() >= deadline) throw new Error("__TIME__");
+/* ------------------ TT (Transposition Table) ------------------ */
+const TT = new Map(); // BigInt -> entry
+const TT_MAX = 200000;
+
+const TT_EXACT = 0;
+const TT_LOWER = 1;
+const TT_UPPER = 2;
+
+let searchGen = 0;
+
+function ttGet(key){
+  return TT.get(key);
+}
+function ttPut(key, entry){
+  if (TT.size > TT_MAX) TT.clear();
+  TT.set(key, entry);
 }
 
-/* ===================== ordering ===================== */
-function moveScore(state, mv, ttMovePacked, ply){
-  let sc = 0;
-  const pm = packMove(mv);
+/* ------------------ Move ordering heuristics ------------------ */
+const killer1 = new Uint32Array(128);
+const killer2 = new Uint32Array(128);
+// history[sideIdx][from*81+to] : bonus
+const historyH = [new Int32Array(81*81), new Int32Array(81*81)];
 
-  if (ttMovePacked >= 0 && pm === ttMovePacked) sc += 1000000;
+function isCapture(mv){ return mv.capturedPiece !== 0; }
 
-  const cap = (mv.fromSq !== -1) ? state.board81[mv.toSq] : 0;
-  if (cap) {
-    const victim = VALUE[typeNameFromAbsId(Math.abs(cap))] || 0;
-    sc += 200000 + victim;
-    if (mv.promote) sc += 2000;
-  } else {
-    if (killer1[ply] === pm) sc += 150000;
-    else if (killer2[ply] === pm) sc += 140000;
-    sc += (hist[histIndex(mv.fromSq, mv.toSq)] || 0);
-    if (mv.fromSq === -1) sc += 500;
+function orderScoreForMove(mv, ply, ttMoveKey){
+  let s = 0;
+
+  // TT move first
+  if (ttMoveKey !== 0 && sameMoveKey(mv.key, ttMoveKey)) s += 1_000_000_000;
+
+  // captures: MVV-LVA style
+  if (mv.capturedPiece){
+    const capPt = Math.abs(mv.capturedPiece);
+    const mvPt = mv.movedPt;
+    s += 200_000 + (VALUE[capPt]||0) * 10 - (VALUE[mvPt]||0);
   }
-  return sc;
-}
 
-function orderMoves(state, moves, ttMove, ply){
-  const ttPacked = ttMove ? packMove(ttMove) : -1;
-  const scored = moves.map(mv => ({mv, sc: moveScore(state, mv, ttPacked, ply)}));
-  scored.sort((a,b)=>b.sc-a.sc);
-  return scored.map(x=>x.mv);
-}
+  // promote
+  if (!mv.dropPt && mv.promote) s += 20_000;
 
-/* ===================== quiescence ===================== */
-function quiescence(state, alpha, beta, useNN, deadline, requestId){
-  timeOrCancel(deadline, requestId);
+  // gives check
+  if (mv.givesCheck) s += 15_000;
 
-  const stand = evalForSearch(state, useNN);
-  if (stand >= beta) return stand;
-  if (stand > alpha) alpha = stand;
+  // killers (quiet moves)
+  if (!mv.capturedPiece && !mv.dropPt) {
+    if (mv.key === killer1[ply]) s += 12_000;
+    else if (mv.key === killer2[ply]) s += 8_000;
 
-  const caps = genLegalCaptures(state);
-  if (caps.length === 0) return stand;
-
-  caps.sort((a,b)=>{
-    const va = VALUE[typeNameFromAbsId(Math.abs(state.board81[a.toSq]||0))]||0;
-    const vb = VALUE[typeNameFromAbsId(Math.abs(state.board81[b.toSq]||0))]||0;
-    return vb - va;
-  });
-
-  const stack = [];
-  for (const mv of caps){
-    makeMove(state, mv, stack);
-    const score = -quiescence(state, -beta, -alpha, useNN, deadline, requestId);
-    unmakeMove(state, stack);
-
-    if (score >= beta) return score;
-    if (score > alpha) alpha = score;
+    // history
+    const sIdx = sideIdxFromSign(-sideSign); // careful: during ordering, sideSign is current. we are scoring for current side.
+    const from = mv.fromSq >= 0 ? mv.fromSq : mv.toSq; // drop uses toSq
+    const to = mv.toSq;
+    s += historyH[sIdx][from*81 + to] | 0;
   }
-  return alpha;
+
+  return s;
 }
 
-/* ===================== negamax (v9: PVS + LMR) ===================== */
-function negamax(state, depth, alpha, beta, useNN, deadline, requestId, ply){
-  timeOrCancel(deadline, requestId);
+function updateKillersAndHistory(mv, ply, depth){
+  // update on beta cutoff
+  if (mv.capturedPiece || mv.dropPt) return; // quiet only for killer/history
+  const key = mv.key;
 
-  const inCheckHere = isKingInCheck(state.board81, state.side, state.kingSqS, state.kingSqG);
-  if (inCheckHere) depth += 1;
-
-  const probe = ttProbe(state.hash, depth, alpha, beta);
-  alpha = probe.alpha; beta = probe.beta;
-  const ttMove = probe.best;
-  if (probe.hit && probe.cut) return probe.value;
-
-  if (depth <= 0) return quiescence(state, alpha, beta, useNN, deadline, requestId);
-
-  const legals = genLegalMoves(state);
-  if (legals.length === 0){
-    return inCheckHere ? -999999 : 0;
+  if (killer1[ply] !== key){
+    killer2[ply] = killer1[ply];
+    killer1[ply] = key;
   }
+
+  const sIdx = sideIdxFromSign(-sideSign); // current side before makeMove
+  const from = mv.fromSq;
+  const to = mv.toSq;
+  if (from >= 0){
+    const idx = from*81 + to;
+    historyH[sIdx][idx] += depth * depth;
+    if (historyH[sIdx][idx] > 1_000_000) historyH[sIdx].fill(0); // prevent overflow
+  }
+}
+
+/* ------------------ Search (alpha-beta + TT + aspiration) ------------------ */
+let stop = false;
+let tStart = 0;
+let tLimit = 0;
+let nodes = 0;
+
+function timeUp(){
+  return (performance.now() - tStart) >= tLimit;
+}
+
+const INF = 1e15;
+const MATE = 1_000_000;
+
+function negamax(depth, alpha, beta, ply, useNN){
+  if (stop) return 0;
+  if ((nodes & 2047) === 0 && timeUp()){
+    stop = true;
+    return 0;
+  }
+  nodes++;
 
   const alpha0 = alpha;
-  const ordered = orderMoves(state, legals, ttMove, ply);
-  const stack = [];
 
-  let best = -Infinity;
-  let bestMove = ordered[0] || null;
+  // TT probe
+  const key = hashKey;
+  const ent = ttGet(key);
+  let ttMoveKey = 0;
+  if (ent){
+    ttMoveKey = ent.bestKey || 0;
+    if (ent.depth >= depth){
+      const v = ent.value;
+      if (ent.flag === TT_EXACT) return v;
+      if (ent.flag === TT_LOWER) alpha = Math.max(alpha, v);
+      else if (ent.flag === TT_UPPER) beta = Math.min(beta, v);
+      if (alpha >= beta) return v;
+    }
+  }
 
-  let moveNum = 0;
-  let firstMove = true;
+  // generate legal
+  const legals = generateLegalMovesForCurrentSide();
+  if (legals.length === 0){
+    // checkmate/stalemate
+    if (isKingInCheck(sideSign)) return -MATE + ply;
+    return 0;
+  }
 
-  for (const mv of ordered){
-    moveNum++;
-    timeOrCancel(deadline, requestId);
+  if (depth <= 0){
+    return evalScore(useNN);
+  }
 
-    const quiet = isQuietMove(state, mv);
-    const depthLeft = depth - 1;
+  // order moves
+  for (let i=0;i<legals.length;i++){
+    legals[i]._ord = orderScoreForMove(legals[i], ply, ttMoveKey);
+  }
+  legals.sort((a,b)=> (b._ord - a._ord));
 
-    // LMR（遅い静かな手を浅く）
-    let reducedDepth = depthLeft;
-    let didReduce = false;
-    if (!inCheckHere &&
-        depth >= LMR_MIN_DEPTH &&
-        moveNum >= LMR_MOVE_NUM &&
-        quiet &&
-        mv.fromSq !== -1 &&          // 盤上の手だけ（打ちは重要なことが多いので安全側）
-        !mv.promote) {               // 成りは重要度高めなので減らさない
-      reducedDepth = Math.max(0, depthLeft - LMR_REDUCTION);
-      didReduce = (reducedDepth !== depthLeft);
+  let bestVal = -INF;
+  let bestKey = 0;
+
+  for (let i=0;i<legals.length;i++){
+    const mv = legals[i];
+    makeMove(mv);
+    const v = -negamax(depth-1, -beta, -alpha, ply+1, useNN);
+    unmakeMove();
+
+    if (stop) break;
+
+    if (v > bestVal){
+      bestVal = v;
+      bestKey = mv.key;
     }
 
-    makeMove(state, mv, stack);
-
-    let score;
-    if (firstMove || !Number.isFinite(alpha) || !Number.isFinite(beta)) {
-      score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, ply+1);
-      firstMove = false;
-    } else {
-      // PVS: まず null-window
-      score = -negamax(state, reducedDepth, -(alpha + PVS_WINDOW), -alpha, useNN, deadline, requestId, ply+1);
-
-      // LMRで浅読みして上回ったら、同深さで null-window 再探索
-      if (didReduce && score > alpha) {
-        score = -negamax(state, depthLeft, -(alpha + PVS_WINDOW), -alpha, useNN, deadline, requestId, ply+1);
-      }
-
-      // 改善し、かつ beta 未満ならフルウィンドウで確定
-      if (score > alpha && score < beta) {
-        score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, ply+1);
-      }
-    }
-
-    unmakeMove(state, stack);
-
-    if (score > best){ best = score; bestMove = mv; }
-    if (score > alpha) alpha = score;
-
+    if (v > alpha) alpha = v;
     if (alpha >= beta){
-      if (quiet) recordKillerAndHistory(ply, mv, depth);
+      // beta cutoff
+      updateKillersAndHistory(mv, ply, depth);
       break;
     }
   }
 
+  // TT store
   let flag = TT_EXACT;
-  if (best <= alpha0) flag = TT_UPPER;
-  else if (best >= beta) flag = TT_LOWER;
+  if (bestVal <= alpha0) flag = TT_UPPER;
+  else if (bestVal >= beta) flag = TT_LOWER;
 
-  ttStore(state.hash, depth, best, flag, bestMove);
-  return best;
+  ttPut(key, {
+    depth,
+    flag,
+    value: bestVal,
+    bestKey,
+    gen: searchGen,
+  });
+
+  return bestVal;
 }
 
-/* ===================== root (PVS) ===================== */
-function chooseBestRoot(state, depth, useNN, deadline, requestId, alphaInit, betaInit){
-  timeOrCancel(deadline, requestId);
+function searchRoot(depth, alpha, beta, useNN){
+  const legals = generateLegalMovesForCurrentSide();
+  if (legals.length === 0){
+    if (isKingInCheck(sideSign)) return {score: -MATE, best:null};
+    return {score: 0, best:null};
+  }
 
-  const probe = ttProbe(state.hash, depth, alphaInit, betaInit);
-  const ttMove = probe.best;
+  // TT best at root
+  const ent = ttGet(hashKey);
+  const ttMoveKey = ent?.bestKey || 0;
 
-  const legals = genLegalMoves(state);
-  if (legals.length === 0) return {ok:false};
+  for (let i=0;i<legals.length;i++){
+    legals[i]._ord = orderScoreForMove(legals[i], 0, ttMoveKey);
+  }
+  legals.sort((a,b)=> (b._ord - a._ord));
 
-  const ordered = orderMoves(state, legals, ttMove, 0);
-  const stack = [];
+  let best = null;
+  let bestScore = -INF;
 
-  let bestMove = ordered[0] || null;
-  let bestScore = -Infinity;
+  for (let i=0;i<legals.length;i++){
+    const mv = legals[i];
 
-  let alpha = alphaInit;
-  const beta = betaInit;
+    makeMove(mv);
+    const v = -negamax(depth-1, -beta, -alpha, 1, useNN);
+    unmakeMove();
 
-  let timedOut = false;
-  let firstMove = true;
+    if (stop) break;
 
-  for (const mv of ordered){
-    timeOrCancel(deadline, requestId);
+    if (v > bestScore){
+      bestScore = v;
+      best = mv;
+    }
+    if (v > alpha) alpha = v;
+  }
 
-    makeMove(state, mv, stack);
+  return {score: bestScore, best};
+}
 
-    let score = null;
-    try {
-      const depthLeft = depth - 1;
+/* aspiration window iterative deepening */
+function thinkIterative(depthMax, timeMs, useNN, requestId){
+  stop = false;
+  nodes = 0;
+  tStart = performance.now();
+  tLimit = Math.max(20, timeMs|0);
 
-      if (firstMove || !Number.isFinite(alpha) || !Number.isFinite(beta)) {
-        score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, 1);
-        firstMove = false;
-      } else {
-        score = -negamax(state, depthLeft, -(alpha + PVS_WINDOW), -alpha, useNN, deadline, requestId, 1);
-        if (score > alpha && score < beta) {
-          score = -negamax(state, depthLeft, -beta, -alpha, useNN, deadline, requestId, 1);
-        }
-      }
-    } catch(e){
-      if (e && (e.message === "__TIME__" || e.message === "__CANCEL__" || e === "__TIME__" || e === "__CANCEL__")) {
-        timedOut = true;
-      } else {
-        throw e;
-      }
-    } finally {
-      unmakeMove(state, stack);
+  searchGen++;
+
+  let bestMove = null;
+  let bestScore = 0;
+  let depthDone = 0;
+
+  // aspiration params
+  let prev = 0;
+  let window = 250; // initial aspiration window
+
+  for (let d=1; d<=depthMax; d++){
+    if (timeUp()){ stop = true; break; }
+
+    let a = -INF, b = INF;
+
+    if (d >= 2){
+      a = prev - window;
+      b = prev + window;
     }
 
-    if (timedOut) break;
+    // aspiration loop
+    let result;
+    while (true){
+      result = searchRoot(d, a, b, useNN);
+      if (stop) break;
 
-    if (score > bestScore){ bestScore = score; bestMove = mv; }
-    if (score > alpha) alpha = score;
-    if (alpha >= beta) break;
-  }
+      const s = result.score;
 
-  if (!bestMove || bestScore === -Infinity) return {ok:false};
+      if (d < 2) break;
 
-  const fail =
-    (bestScore <= alphaInit) ? "low" :
-    (bestScore >= betaInit) ? "high" : "ok";
+      if (s <= a){
+        // fail-low
+        a = -INF;
+        window *= 2;
+        b = prev + window;
+        continue;
+      }
+      if (s >= b){
+        // fail-high
+        b = INF;
+        window *= 2;
+        a = prev - window;
+        continue;
+      }
+      break;
+    }
 
-  if (!timedOut) ttStore(state.hash, depth, bestScore, TT_EXACT, bestMove);
+    if (stop) break;
 
-  return { ok:true, move: bestMove, score: bestScore, partial: timedOut, fail };
-}
+    if (result.best){
+      bestMove = result.best;
+      bestScore = result.score;
+      prev = bestScore;
+      depthDone = d;
 
-function toUiMove(mv){
-  if (mv.fromSq === -1){
-    const to = xyFromSq(mv.toSq);
-    return {from:null, to, drop: typeNameFromAbsId(mv.dropAbsId), promote:false};
-  }
-  const from = xyFromSq(mv.fromSq);
-  const to = xyFromSq(mv.toSq);
-  return {from, to, drop:null, promote: !!mv.promote};
-}
-
-/* ===================== init TF ===================== */
-async function initTF(modelUrl, backend){
-  try {
-    importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js");
-    tf = self.tf;
-
-    if (backend === "wasm") {
-      importScripts("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/tf-backend-wasm.min.js");
-      tf.wasm.setWasmPaths("https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.22.0/dist/");
-      await tf.setBackend("wasm");
-      await tf.ready();
+      postMessage({
+        type: "progress",
+        requestId,
+        depthDone,
+        depthMax,
+        bestMove: mvToUI(bestMove),
+        bestStr: mvToBestStr(bestMove),
+        bestScore,
+        partial: true,
+      });
     } else {
-      await tf.setBackend("cpu");
-      await tf.ready();
+      // no best move
+      break;
     }
-
-    model = await tf.loadGraphModel(modelUrl, { fromTFHub:false });
-
-    try {
-      const meta = await (await fetch(modelUrl, { cache:"no-store" })).json();
-      const ins = meta?.signature?.inputs || null;
-      const outs = meta?.signature?.outputs || null;
-      const inKeys = ins ? Object.keys(ins) : [];
-      const outKeys = outs ? Object.keys(outs) : [];
-      if (inKeys.length) {
-        inputKey = inKeys[0];
-        expectedD = parseInt(ins[inputKey]?.tensorShape?.dim?.[1]?.size || expectedD, 10);
-      }
-      if (outKeys.length) outputName = outs[outKeys[0]]?.name || outputName;
-    } catch(e){}
-
-    tf.tidy(() => {
-      const z = tf.zeros([1, D], "float32");
-      const dict = { [inputKey]: z };
-      const out = outputName ? model.execute(dict, outputName) : model.execute(dict);
-      const y = Array.isArray(out) ? out[0] : out;
-      y.dataSync();
-    });
-
-    modelStatus = "読込完了";
-    return {ok:true, info:`backend=${tf.getBackend()} inputKey=${inputKey} D=${expectedD} TT=${TT_SIZE} EvalTT=${ETT_SIZE}`};
-  } catch(e) {
-    model=null;
-    modelStatus="読込失敗";
-    return {ok:false, error:(e?.message || String(e))};
   }
+
+  const partial = (depthDone < depthMax);
+  const elapsed = (performance.now() - tStart) | 0;
+
+  return {
+    ok: !!bestMove,
+    depthDone,
+    depthMax,
+    bestMove,
+    bestScore,
+    partial,
+    timeMs: elapsed,
+    nodes,
+  };
 }
 
-/* ===================== message loop ===================== */
-self.onmessage = async (ev) => {
-  const msg = ev.data || {};
+/* ------------------ Load position from main ------------------ */
+function loadPos(pos){
+  // board
+  boardA.fill(0);
+  handsA[0].fill(0);
+  handsA[1].fill(0);
+
+  // side
+  sideSign = (pos.sideToMove === "S") ? 1 : -1;
+
+  // board[y][x]
+  for (let y=0;y<9;y++){
+    for (let x=0;x<9;x++){
+      const p = pos.board?.[y]?.[x];
+      if (!p) continue;
+      const pt = PTYPE[p.type] || 0;
+      if (!pt) continue;
+      const s = (p.side === "S") ? 1 : -1;
+      const sq = sqIndex(x,y);
+      boardA[sq] = s * pt;
+    }
+  }
+
+  // hands
+  const hs = pos.hands || {};
+  const hS = hs.S || {};
+  const hG = hs.G || {};
+  const fillHand = (arr, hObj) => {
+    arr[0] = (hObj.FU|0) || 0;
+    arr[1] = (hObj.KY|0) || 0;
+    arr[2] = (hObj.KE|0) || 0;
+    arr[3] = (hObj.GI|0) || 0;
+    arr[4] = (hObj.KI|0) || 0;
+    arr[5] = (hObj.KA|0) || 0;
+    arr[6] = (hObj.HI|0) || 0;
+  };
+  fillHand(handsA[0], hS);
+  fillHand(handsA[1], hG);
+
+  // hash
+  hashKey = computeHash();
+  undoStack.length = 0;
+}
+
+/* ------------------ Worker message handling ------------------ */
+self.onmessage = async (e) => {
+  const msg = e.data || {};
 
   if (msg.type === "init") {
-    const r = await initTF(msg.modelUrl, msg.backend || "wasm");
-    self.postMessage({ type:"init_done", ok:r.ok, error:r.error, info:r.info || "" });
-    return;
-  }
+    const modelUrl = msg.modelUrl || "./shogi_eval_wars_tfjs/model.json";
+    const backend = msg.backend || "wasm";
 
-  if (msg.type === "cancel") {
-    cancelRequestId = msg.requestId;
+    const r = await initTf(modelUrl, backend);
+    if (r.ok) {
+      postMessage({ type:"init_done", ok:true, info: modelInfo });
+    } else {
+      postMessage({ type:"init_done", ok:false, error: r.error || "init failed" });
+    }
     return;
   }
 
   if (msg.type === "think") {
-    const requestId = msg.requestId;
-    const depthMax = msg.depthMax || 4;
-    const timeMs = msg.timeMs || 500;
+    const requestId = msg.requestId || 0;
+    const depthMax = Math.max(1, Math.min(10, msg.depthMax|0));
+    const timeMs = Math.max(50, msg.timeMs|0);
     const useNN = !!msg.useNN;
 
-    const start = Date.now();
-    const deadline = start + timeMs;
+    // (optional) clear evalCache each think to avoid memory growth / stale
+    evalCache.clear();
 
-    const st0 = convertPos(msg.pos);
+    loadPos(msg.pos);
 
-    let bestMove = null;
-    let bestScore = null;
-    let bestStr = "-";
-    let depthDone = 0;
-    let partial = false;
+    const r = thinkIterative(depthMax, timeMs, useNN, requestId);
 
-    const BASE_WINDOW = 250;
-
-    try {
-      for (let d=1; d<=depthMax; d++){
-        timeOrCancel(deadline, requestId);
-
-        let r = null;
-
-        if (d >= 3 && bestScore != null && Number.isFinite(bestScore)) {
-          let window = Math.max(BASE_WINDOW, Math.min(2000, Math.abs(bestScore) * 0.2));
-          let alpha = bestScore - window;
-          let beta  = bestScore + window;
-
-          for (let attempt=0; attempt<3; attempt++){
-            timeOrCancel(deadline, requestId);
-
-            r = chooseBestRoot(st0, d, useNN, deadline, requestId, alpha, beta);
-
-            if (r.partial) break;
-            if (r.fail === "ok") break;
-
-            window *= 2;
-            alpha = bestScore - window;
-            beta  = bestScore + window;
-
-            if (window > 8000) {
-              alpha = -Infinity; beta = Infinity;
-            }
-          }
-
-          if (!r || !r.ok) {
-            r = chooseBestRoot(st0, d, useNN, deadline, requestId, -Infinity, Infinity);
-          }
-        } else {
-          r = chooseBestRoot(st0, d, useNN, deadline, requestId, -Infinity, Infinity);
-        }
-
-        if (!r || !r.ok || !r.move) break;
-
-        bestMove = r.move;
-        bestScore = r.score;
-        bestStr = moveToBestStr(bestMove);
-        depthDone = d;
-        partial = !!r.partial;
-
-        self.postMessage({
-          type:"progress",
-          requestId,
-          depthDone,
-          depthMax,
-          bestScore,
-          bestStr,
-          partial
-        });
-
-        if (partial) break;
-      }
-    } catch(e) {
-      // time/cancel は想定内
-    }
-
-    self.postMessage({
-      type:"result",
+    postMessage({
+      type: "result",
       requestId,
-      ok: !!bestMove,
-      bestMove: bestMove ? toUiMove(bestMove) : null,
-      bestScore,
-      bestStr,
-      depthDone,
-      partial,
-      timeMs: Date.now() - start,
-      modelStatus
+      ok: r.ok,
+      depthDone: r.depthDone,
+      depthMax: r.depthMax,
+      bestMove: r.bestMove ? mvToUI(r.bestMove) : null,
+      bestStr: r.bestMove ? mvToBestStr(r.bestMove) : "-",
+      bestScore: r.bestScore,
+      partial: r.partial,
+      timeMs: r.timeMs,
+      nodes: r.nodes,
     });
+    return;
   }
 };
