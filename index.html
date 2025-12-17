@@ -3,10 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Shogi NN (TFJS) Demo</title>
-
-  <!-- TFJS -->
-  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+  <title>Shogi NN (TFJS + Worker) v4</title>
 
   <style>
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; margin: 16px; }
@@ -26,16 +23,18 @@
     .muted { color:#666; font-size:12px; }
     button { padding:8px 12px; border-radius:10px; border:1px solid #aaa; background:#f7f7f7; cursor:pointer; }
     button.primary { background:#1e90ff; border-color:#1e90ff; color:#fff; }
-    input[type="number"]{ width:70px; padding:6px; border-radius:8px; border:1px solid #aaa; }
+    button.danger { background:#ff3b30; border-color:#ff3b30; color:#fff; }
+    input[type="number"]{ width:86px; padding:6px; border-radius:8px; border:1px solid #aaa; }
     label { display:inline-flex; gap:8px; align-items:center; }
     .status { white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .pill { display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid #ddd; font-size:12px; background:#fafafa; }
   </style>
 </head>
 
 <body>
-  <h1>将棋AI（NN評価 + αβ探索）</h1>
+  <h1>将棋AI（NN評価 + αβ探索）v4（WebWorker）</h1>
   <div class="muted">
-    NNモデル: <code>./shogi_eval_wars_tfjs/model.json</code>（入力名は読み取れた場合だけ表示）
+    モデル: <code>./shogi_eval_wars_tfjs/model.json</code>（Worker側で読み込み）
   </div>
 
   <div class="row" style="margin-top:12px;">
@@ -49,16 +48,21 @@
       </div>
     </div>
 
-    <div class="card" style="min-width:320px;">
+    <div class="card" style="min-width:340px;">
       <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
         <button id="btnReset">初期化</button>
         <button id="btnUndo">1手戻す</button>
         <button id="btnAIMove" class="primary">AIに指させる</button>
+        <button id="btnStop" class="danger">停止</button>
       </div>
 
       <div style="margin-top:10px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
-        <label>探索深さ(手数)
-          <input id="depth" type="number" min="1" max="7" value="3" />
+        <label>最大深さ
+          <input id="depth" type="number" min="1" max="10" value="4" />
+        </label>
+
+        <label>思考(ms)
+          <input id="timeMs" type="number" min="50" max="5000" value="500" />
         </label>
 
         <label>
@@ -67,8 +71,14 @@
         </label>
       </div>
 
+      <div style="margin-top:8px; display:flex; gap:8px; flex-wrap:wrap;">
+        <span class="pill">UIは固まらない</span>
+        <span class="pill">時間で打ち切り</span>
+        <span class="pill">反復深化</span>
+      </div>
+
       <div style="margin-top:10px;">
-        <div class="muted">操作：自分の駒をクリック→移動先をクリック。持ち駒はボタン→空マスクリックで打ち。</div>
+        <div class="muted">操作：自分の駒→移動先。持ち駒→空マスで打ち。</div>
       </div>
 
       <div style="margin-top:10px;">
@@ -78,7 +88,6 @@
     </div>
   </div>
 
-  <!-- キャッシュ回避のためクエリ付け -->
-  <script src="./main.js?v=20251216_v3"></script>
+  <script src="./main.js?v=20251217_v4"></script>
 </body>
 </html>
