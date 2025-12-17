@@ -1,67 +1,80 @@
-/* main.js v4 (UI thread)
-   - 探索＋NN推論は worker.js に移動（UI固まらない）
+/* Shogi AI (WebWorker + TFJS NN eval) main.js
+   - UI/ルールはブラウザ側
+   - 探索＋NN評価は worker.js 側
+   - status に best/score を必ず表示（best=- 問題を解消）
+
+   前提:
+   - index.html に #board #handsS #handsG #status #depth #useNN がある
+   - worker.js が postMessage で {type:"init_done"} / {type:"progress"} / {type:"result"} を返す
 */
 
+"use strict";
+
+/* ------------------ Config ------------------ */
 const MODEL_URL = "./shogi_eval_wars_tfjs/model.json";
-const WORKER_URL = "./worker.js?v=20251217_v8";
+const WORKER_URL = "./worker.js?v=20251217";
+const WORKER_BACKEND = "wasm"; // "wasm" 推奨。ダメなら "cpu" に
 
-let worker = null;
-let workerReady = false;
-let workerModelStatus = "未初期化";
-let workerLastInfo = "";
-let thinking = false;
-let lastRequestId = 0;
-
-/* ------------------ Shogi Model (same as before) ------------------ */
+/* ------------------ Game State ------------------ */
 const PIECE_JA = {FU:"歩",KY:"香",KE:"桂",GI:"銀",KI:"金",KA:"角",HI:"飛",OU:"玉",TO:"と",NY:"杏",NK:"圭",NG:"全",UM:"馬",RY:"龍"};
 const PROM_MAP = {FU:"TO", KY:"NY", KE:"NK", GI:"NG", KA:"UM", HI:"RY"};
 const UNPROM_MAP = {TO:"FU", NY:"KY", NK:"KE", NG:"GI", UM:"KA", RY:"HI"};
 
 let board, hands, sideToMove;
-let selected = null;
-let selectedDrop = null;
+let selected = null;      // {x,y}
+let selectedDrop = null;  // 'FU'.. drop piece
 let history = [];
 
 /* ------------------ UI ------------------ */
-const elBoard = document.getElementById("board");
+const elBoard  = document.getElementById("board");
 const elHandsS = document.getElementById("handsS");
 const elHandsG = document.getElementById("handsG");
 const elStatus = document.getElementById("status");
-const elDepth = document.getElementById("depth");
-const elTimeMs = document.getElementById("timeMs");
-const elUseNN = document.getElementById("useNN");
+const elDepth  = document.getElementById("depth");
+const elUseNN  = document.getElementById("useNN");
 
-const btnReset = document.getElementById("btnReset");
-const btnUndo = document.getElementById("btnUndo");
-const btnAIMove = document.getElementById("btnAIMove");
-const btnStop = document.getElementById("btnStop");
+document.getElementById("btnReset").onclick = () => resetGame();
+document.getElementById("btnUndo").onclick  = () => undo();
+document.getElementById("btnAIMove").onclick = () => aiMove();
 
-btnReset.onclick = () => resetGame();
-btnUndo.onclick = () => undo();
-btnAIMove.onclick = () => aiMove();
-btnStop.onclick = () => stopAI();
+/* ------------------ Worker 状態（表示用） ------------------ */
+let worker = null;
+let workerReady = false;
+let workerModelStatus = "未初期化";
+let workerInfo = "";
+let thinking = false;
+
+let reqSeq = 0;
+let currentRequestId = 0;
+
+// 探索ログ（表示用）
+let lastDepthDone = 0;
+let lastDepthMax = 0;
+let lastBestScore = null;
+let lastBestStr = "-";
+let lastTimeMs = 0;
+let lastPartial = false;
 
 function setStatus(extra = "") {
   const nn = elUseNN?.checked ? "ON" : "OFF";
-  const legal = (board && hands && sideToMove) ? countLegalMoves(board, hands, sideToMove) : 0;
-  const chk = (board && sideToMove && isKingInCheck(board, sideToMove)) ? "（王手）" : "";
+  const legal = countLegalMoves(board, hands, sideToMove);
+  const chk = isKingInCheck(board, sideToMove) ? "（王手）" : "";
 
-  const w = workerReady ? "ready" : "not-ready";
-  const busy = thinking ? "YES" : "NO";
+  const fmtScore = (v) => (typeof v === "number" ? v.toFixed(6) : "-");
+  const fmtDepthMax = (lastDepthMax > 0 ? String(lastDepthMax) : "-");
 
   elStatus.textContent =
-`手番: ${sideToMove || "-"} ${chk}
+`手番: ${sideToMove} ${chk}
 NN: ${nn}
-Worker: ${w} / thinking: ${busy}
+Worker: ${workerReady ? "ready" : "not ready"} / thinking: ${thinking ? "YES" : "NO"}
 Worker model: ${workerModelStatus}
-${workerLastInfo}
+depth=${lastDepthDone}/${fmtDepthMax} best=${lastBestStr} score=${fmtScore(lastBestScore)}
 合法手数: ${legal}
-${extra}`.trim();
-
-  btnAIMove.disabled = !workerReady || thinking;
-  btnStop.disabled = !thinking;
+AI: depth_done=${lastDepthDone} time=${lastTimeMs}ms${lastPartial ? " (partial)" : ""} score=${fmtScore(lastBestScore)}
+${extra}`.replace(/\n{2,}/g, "\n").trim();
 }
 
+/* ------------------ Render ------------------ */
 function render() {
   elBoard.innerHTML = "";
   for (let y = 0; y < 9; y++) {
@@ -70,6 +83,7 @@ function render() {
       const td = document.createElement("td");
       td.dataset.x = x; td.dataset.y = y;
       const p = board[y][x];
+
       if (p) {
         const s = PIECE_JA[p.type] || p.type;
         td.innerHTML = (p.side === 'G') ? `<span class="piece-g">${s}</span>` : s;
@@ -84,6 +98,7 @@ function render() {
 
   renderHands('S', elHandsS);
   renderHands('G', elHandsG);
+
   setStatus();
 }
 
@@ -93,6 +108,7 @@ function renderHands(side, el) {
   for (const t of order) {
     const n = hands[side][t] || 0;
     if (n <= 0) continue;
+
     const btn = document.createElement("button");
     btn.className = "handbtn" + (selectedDrop === t && sideToMove === side ? " sel" : "");
     btn.textContent = `${PIECE_JA[t]}×${n}`;
@@ -106,15 +122,16 @@ function renderHands(side, el) {
   }
 }
 
+/* ------------------ Click handling ------------------ */
 function onSquareClick(x, y) {
-  if (thinking) return; // 思考中は操作を止めたいならON（外してもOK）
-
   // drop mode
   if (selectedDrop) {
     if (board[y][x]) return;
+
     const mv = {from:null, to:{x,y}, drop:selectedDrop, promote:false};
     const legals = generateLegalMoves(board, hands, sideToMove);
     if (!legals.some(m => moveEq(m, mv))) return;
+
     pushHistory();
     ({board, hands, sideToMove} = applyMove(board, hands, sideToMove, mv));
     selectedDrop = null;
@@ -125,6 +142,7 @@ function onSquareClick(x, y) {
 
   const p = board[y][x];
 
+  // no selection -> select own piece
   if (!selected) {
     if (p && p.side === sideToMove) {
       selected = {x,y};
@@ -133,14 +151,15 @@ function onSquareClick(x, y) {
     return;
   }
 
+  // reselect own
   if (p && p.side === sideToMove) {
     selected = {x,y};
     render();
     return;
   }
 
+  // try move
   const mvBase = {from:{...selected}, to:{x,y}, drop:null, promote:false};
-
   const legals = generateLegalMoves(board, hands, sideToMove);
   const cands = legals.filter(m => sameFromTo(m, mvBase) && !m.drop);
   if (cands.length === 0) return;
@@ -159,6 +178,7 @@ function onSquareClick(x, y) {
 
 function afterMove() {
   render();
+
   const legals = generateLegalMoves(board, hands, sideToMove);
   if (legals.length === 0) {
     const chk = isKingInCheck(board, sideToMove);
@@ -174,7 +194,17 @@ function resetGame() {
   selected = null;
   selectedDrop = null;
   history = [];
+
   setupInitialPosition(board);
+
+  // 表示ログもリセット
+  lastDepthDone = 0;
+  lastDepthMax = 0;
+  lastBestScore = null;
+  lastBestStr = "-";
+  lastTimeMs = 0;
+  lastPartial = false;
+
   render();
 }
 function pushHistory() {
@@ -187,119 +217,18 @@ function pushHistory() {
 function undo() {
   const st = history.pop();
   if (!st) return;
-  board = st.board; hands = st.hands; sideToMove = st.side;
-  selected = null; selectedDrop = null;
+  board = st.board;
+  hands = st.hands;
+  sideToMove = st.side;
+  selected = null;
+  selectedDrop = null;
   render();
 }
-resetGame();
 
-/* ------------------ Worker ------------------ */
-function initWorker() {
-  worker = new Worker(WORKER_URL);
-  workerReady = false;
-  workerModelStatus = "初期化中...";
-  workerLastInfo = "";
-  setStatus();
-
-  worker.onmessage = (e) => {
-  const msg = e.data || {};
-
-  if (msg.type === "init_done") {
-    workerReady = true;
-    workerModelStatus = msg.ok ? "読込完了" : ("読込失敗: " + (msg.error || ""));
-    workerInfo = msg.info || "";
-    thinking = false;
-    setStatus();
-    return;
-  }
-
-  if (msg.type === "progress") {
-    // ★bestStr が来たら表示に使う（best=- を解消）
-    if (typeof msg.bestStr === "string") lastBestStr = msg.bestStr;
-
-    if (typeof msg.bestScore === "number") lastBestScore = msg.bestScore;
-    if (typeof msg.depthDone === "number") lastDepthDone = msg.depthDone;
-    if (typeof msg.depthMax === "number") lastDepthMax = msg.depthMax;
-    if (typeof msg.partial === "boolean") lastPartial = msg.partial;
-
-    setStatus();
-    return;
-  }
-
-  if (msg.type === "result") {
-    thinking = false;
-
-    if (typeof msg.bestStr === "string") lastBestStr = msg.bestStr; // ★ここも
-    if (typeof msg.bestScore === "number") lastBestScore = msg.bestScore;
-    if (typeof msg.depthDone === "number") lastDepthDone = msg.depthDone;
-    lastTimeMs = msg.timeMs || 0;
-
-    if (msg.ok && msg.bestMove) {
-      // 盤に適用（既存の applyMove を使う想定）
-      pushHistory();
-      ({ board, hands, sideToMove } = applyMove(board, hands, sideToMove, msg.bestMove));
-      selected = null; selectedDrop = null;
-      afterMove();
-    } else {
-      setStatus("AI: no move");
-    }
-    return;
-  }
-};
-
-  worker.onerror = (e) => {
-    console.error("worker error:", e);
-    workerReady = false;
-    workerModelStatus = "Workerエラー";
-    setStatus();
-  };
-
-  worker.postMessage({
-    type: "init",
-    modelUrl: MODEL_URL,
-    backend: "wasm" // ここは 'cpu' でもOK
-  });
-}
-initWorker();
-
-function stopAI() {
-  if (!worker || !thinking) return;
-  worker.postMessage({ type: "cancel", requestId: lastRequestId });
-  // UI側も止める（Workerは自前で止まる）
-  thinking = false;
-  setStatus("停止要求を送信しました");
-}
-
-function aiMove() {
-  if (!workerReady || !worker) return;
-
-  const depthMax = Math.max(1, Math.min(10, parseInt(elDepth.value || "4", 10)));
-  const timeMs = Math.max(50, Math.min(5000, parseInt(elTimeMs.value || "500", 10)));
-  const useNN = !!elUseNN.checked;
-
-  thinking = true;
-  lastRequestId++;
-  setStatus("AI思考中...");
-
-  const pos = {
-    board: cloneBoard(board),
-    hands: cloneHands(hands),
-    sideToMove
-  };
-
-  worker.postMessage({
-    type: "think",
-    requestId: lastRequestId,
-    pos,
-    depthMax,
-    timeMs,
-    useNN
-  });
-}
-
-/* ------------------ Board / Hands helpers ------------------ */
+/* ------------------ Board helpers ------------------ */
 function makeEmptyBoard(){ return Array.from({length:9},()=>Array(9).fill(null)); }
 function cloneBoard(b){ return b.map(row=>row.map(p=>p?{...p}:null)); }
+
 function makeEmptyHands(){
   return { S:{FU:0,KY:0,KE:0,GI:0,KI:0,KA:0,HI:0}, G:{FU:0,KY:0,KE:0,GI:0,KI:0,KA:0,HI:0} };
 }
@@ -308,8 +237,9 @@ function cloneHands(h){
   for (const s of ['S','G']) for (const k in out[s]) out[s][k] = h[s][k]||0;
   return out;
 }
+
 function setupInitialPosition(b){
-  const G='G', S='S';
+  const G = 'G', S = 'S';
   b[0][0]={side:G,type:'KY'}; b[0][1]={side:G,type:'KE'}; b[0][2]={side:G,type:'GI'}; b[0][3]={side:G,type:'KI'};
   b[0][4]={side:G,type:'OU'}; b[0][5]={side:G,type:'KI'}; b[0][6]={side:G,type:'GI'}; b[0][7]={side:G,type:'KE'}; b[0][8]={side:G,type:'KY'};
   b[1][1]={side:G,type:'HI'}; b[1][7]={side:G,type:'KA'};
@@ -321,7 +251,7 @@ function setupInitialPosition(b){
   for (let x=0;x<9;x++) b[6][x]={side:S,type:'FU'};
 }
 
-/* ------------------ Moves / Legal generation (same as before) ------------------ */
+/* ------------------ Move / Rules ------------------ */
 function sameFromTo(a, b){
   return a.from && b.from && a.from.x===b.from.x && a.from.y===b.from.y && a.to.x===b.to.x && a.to.y===b.to.y;
 }
@@ -355,40 +285,10 @@ function applyMove(b, h, side, mv){
 
   let newType = fromP.type;
   if (mv.promote) newType = PROM_MAP[fromP.type] || fromP.type;
-  nb[mv.to.y][mv.to.x] = {side, type: newType};
 
+  nb[mv.to.y][mv.to.x] = {side, type: newType};
   return {board: nb, hands: nh, sideToMove: opponent(side)};
 }
-
-function generateLegalMoves(b, h, side){
-  const moves = [];
-
-  for (let y=0;y<9;y++) for (let x=0;x<9;x++) {
-    const p = b[y][x];
-    if (!p || p.side !== side) continue;
-    const pm = generatePseudoMovesForPiece(b, x, y, p);
-    for (const m of pm) moves.push(m);
-  }
-
-  const dropMoves = generateDropMoves(b, h, side);
-  for (const m of dropMoves) moves.push(m);
-
-  const legals = [];
-  for (const mv of moves) {
-    const st = applyMove(b, h, side, mv);
-    if (!isKingInCheck(st.board, side)) {
-      if (mv.drop === 'FU') {
-        if (isKingInCheck(st.board, opponent(side))) {
-          const reply = generateLegalMoves(st.board, st.hands, opponent(side));
-          if (reply.length === 0) continue;
-        }
-      }
-      legals.push(mv);
-    }
-  }
-  return legals;
-}
-function countLegalMoves(b,h,side){ return generateLegalMoves(b,h,side).length; }
 
 function inPromoZone(side, y){ return side==='S' ? (y<=2) : (y>=6); }
 function mustPromote(pieceType, side, toY){
@@ -455,12 +355,23 @@ function generatePseudoMovesForPiece(b, x, y, p){
 
 function pushMoveWithPromo(arr, mv, pieceType, side, fromY, toY){
   if (!canPromote(pieceType)) { arr.push(mv); return; }
+
   const promoPossible = inPromoZone(side, fromY) || inPromoZone(side, toY);
   const forced = mustPromote(pieceType, side, toY);
+
   if (!promoPossible) { arr.push(mv); return; }
   if (forced) { arr.push({...mv, promote:true}); return; }
+
   arr.push({...mv, promote:false});
   arr.push({...mv, promote:true});
+}
+
+function hasUnpromotedPawnOnFile(b, side, fileX){
+  for (let y=0;y<9;y++){
+    const p = b[y][fileX];
+    if (p && p.side===side && p.type==='FU') return true;
+  }
+  return false;
 }
 
 function generateDropMoves(b, h, side){
@@ -469,6 +380,7 @@ function generateDropMoves(b, h, side){
 
   for (const t of order) {
     if ((h[side][t]||0) <= 0) continue;
+
     for (let y=0;y<9;y++) for (let x=0;x<9;x++) {
       if (b[y][x]) continue;
 
@@ -481,18 +393,43 @@ function generateDropMoves(b, h, side){
       if (t === 'FU') {
         if (hasUnpromotedPawnOnFile(b, side, x)) continue;
       }
+
       res.push({from:null, to:{x,y}, drop:t, promote:false});
     }
   }
   return res;
 }
-function hasUnpromotedPawnOnFile(b, side, fileX){
-  for (let y=0;y<9;y++){
-    const p = b[y][fileX];
-    if (p && p.side===side && p.type==='FU') return true;
+
+function generateLegalMoves(b, h, side){
+  const moves = [];
+
+  for (let y=0;y<9;y++) for (let x=0;x<9;x++) {
+    const p = b[y][x];
+    if (!p || p.side !== side) continue;
+    const pm = generatePseudoMovesForPiece(b, x, y, p);
+    for (const m of pm) moves.push(m);
   }
-  return false;
+
+  const dropMoves = generateDropMoves(b, h, side);
+  for (const m of dropMoves) moves.push(m);
+
+  const legals = [];
+  for (const mv of moves) {
+    const st = applyMove(b, h, side, mv);
+    if (!isKingInCheck(st.board, side)) {
+      // 打ち歩詰め（簡易）
+      if (mv.drop === 'FU') {
+        if (isKingInCheck(st.board, opponent(side))) {
+          const reply = generateLegalMoves(st.board, st.hands, opponent(side));
+          if (reply.length === 0) continue;
+        }
+      }
+      legals.push(mv);
+    }
+  }
+  return legals;
 }
+function countLegalMoves(b,h,side){ return generateLegalMoves(b,h,side).length; }
 
 /* ------------------ Check detection ------------------ */
 function findKing(b, side){
@@ -502,10 +439,12 @@ function findKing(b, side){
   }
   return null;
 }
+
 function isKingInCheck(b, side){
   const k = findKing(b, side);
   if (!k) return false;
   const foe = opponent(side);
+
   for (let y=0;y<9;y++) for (let x=0;x<9;x++){
     const p=b[y][x];
     if (!p || p.side!==foe) continue;
@@ -513,6 +452,7 @@ function isKingInCheck(b, side){
   }
   return false;
 }
+
 function attacksSquare(b, x, y, p, tx, ty){
   const side = p.side;
   const dir = (side === 'S') ? -1 : 1;
@@ -551,3 +491,111 @@ function attacksSquare(b, x, y, p, tx, ty){
   }
   return false;
 }
+
+/* ------------------ Worker init / message ------------------ */
+function initWorker() {
+  try {
+    worker = new Worker(WORKER_URL);
+  } catch (e) {
+    workerReady = false;
+    workerModelStatus = "Worker生成失敗";
+    setStatus(String(e));
+    return;
+  }
+
+  worker.onmessage = (e) => {
+    const msg = e.data || {};
+
+    if (msg.type === "init_done") {
+      workerReady = true;
+      workerModelStatus = msg.ok ? "読込完了" : ("読込失敗: " + (msg.error || ""));
+      workerInfo = msg.info || "";
+      thinking = false;
+      setStatus();
+      return;
+    }
+
+    if (msg.type === "progress") {
+      if (msg.requestId !== currentRequestId) return;
+
+      if (typeof msg.bestStr === "string") lastBestStr = msg.bestStr;
+      if (typeof msg.bestScore === "number") lastBestScore = msg.bestScore;
+      if (typeof msg.depthDone === "number") lastDepthDone = msg.depthDone;
+      if (typeof msg.depthMax === "number") lastDepthMax = msg.depthMax;
+      if (typeof msg.partial === "boolean") lastPartial = msg.partial;
+
+      setStatus();
+      return;
+    }
+
+    if (msg.type === "result") {
+      if (msg.requestId !== currentRequestId) return;
+
+      thinking = false;
+
+      if (typeof msg.bestStr === "string") lastBestStr = msg.bestStr;
+      if (typeof msg.bestScore === "number") lastBestScore = msg.bestScore;
+      if (typeof msg.depthDone === "number") lastDepthDone = msg.depthDone;
+      if (typeof msg.depthMax === "number") lastDepthMax = msg.depthMax;
+      lastTimeMs = msg.timeMs || 0;
+
+      if (msg.ok && msg.bestMove) {
+        pushHistory();
+        ({ board, hands, sideToMove } = applyMove(board, hands, sideToMove, msg.bestMove));
+        selected = null;
+        selectedDrop = null;
+        afterMove();
+      } else {
+        setStatus("AI: no move");
+      }
+      return;
+    }
+  };
+
+  // init を投げる
+  worker.postMessage({
+    type: "init",
+    modelUrl: MODEL_URL,
+    backend: WORKER_BACKEND
+  });
+
+  workerReady = false;
+  workerModelStatus = "初期化中...";
+  setStatus();
+}
+
+/* ------------------ AI Move (worker) ------------------ */
+function aiMove() {
+  if (!worker || !workerReady || thinking) return;
+
+  const depth = Math.max(1, Math.min(7, parseInt(elDepth.value || "3", 10)));
+  const useNN = !!elUseNN.checked;
+
+  const timeMs = 1000; // いままでのログと同じ固定1秒
+
+  // 表示用リセット
+  lastDepthDone = 0;
+  lastDepthMax = depth;
+  lastBestScore = null;
+  lastBestStr = "-";
+  lastTimeMs = 0;
+  lastPartial = false;
+
+  thinking = true;
+  setStatus("AI思考中...");
+
+  currentRequestId = ++reqSeq;
+
+  worker.postMessage({
+    type: "think",
+    requestId: currentRequestId,
+    depthMax: depth,
+    timeMs,
+    useNN,
+    pos: { board, hands, sideToMove }
+  });
+}
+
+/* ------------------ Boot ------------------ */
+resetGame();
+initWorker();
