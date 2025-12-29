@@ -12,7 +12,7 @@
 
 /* ------------------ Config ------------------ */
 const MODEL_URL = "./shogi_eval_wars_tfjs/model.json";
-const WORKER_URL = "./worker.js?v=20251217";
+const WORKER_URL = "./worker.js?v=20251229";
 const WORKER_BACKEND = "wasm"; // "wasm" 推奨。ダメなら "cpu" に
 
 /* ------------------ Game State ------------------ */
